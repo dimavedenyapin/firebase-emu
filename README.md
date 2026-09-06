@@ -7,13 +7,16 @@ projects, not production traffic.
 
 ## Install and run
 
-Release archives are built natively for:
+Release archives are built and smoke-tested natively for:
 
-- macOS 13+ on Intel (`x86_64-apple-darwin`) and Apple Silicon
+- macOS 15 on Intel (`x86_64-apple-darwin`) and Apple Silicon
   (`aarch64-apple-darwin`)
-- glibc-based Linux on x64 (`x86_64-unknown-linux-gnu`) and arm64
-  (`aarch64-unknown-linux-gnu`)
-- 64-bit Windows (`x86_64-pc-windows-msvc`)
+- Ubuntu 24.04 with glibc 2.39 on x64 (`x86_64-unknown-linux-gnu`) and
+  arm64 (`aarch64-unknown-linux-gnu`)
+- Windows Server 2022 x64 (`x86_64-pc-windows-msvc`)
+
+Those are tested baselines, not claims of compatibility with older operating
+system or libc versions.
 
 After a `v0.1.0` release is published, Node 18+ users can run its verified
 prebuilt asset without installing Rust:
