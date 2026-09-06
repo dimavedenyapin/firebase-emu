@@ -40,7 +40,7 @@ limits.
 Local cleanup validation on 2026-09-06 used an isolated release build and
 ports 28080/28099/28199. The Rust target passed all 34/34 assertions (19 Node,
 15 browser): 30 emulator I/O checks and four generic fixture checks. The same
-revision passed Rust 47/47, Functions adapter 10/10, relocated full-binary 1/1,
+revision passed Rust 48/48, Functions adapter 10/10, relocated full-binary 1/1,
 Node unit 5/5, browser unit 15/15, and matrix-gate 1/1; browser and Rust release
 builds also passed. The Google half was not rerun locally because the existing
 interactive stack owns its default ports; the native CI and manual compatibility

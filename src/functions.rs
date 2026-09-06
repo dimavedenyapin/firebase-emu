@@ -16,6 +16,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::PathBuf,
@@ -567,6 +568,32 @@ fn configured_node(codebase: &FunctionCodebase) -> OsString {
         .unwrap_or_else(|| "node".into())
 }
 
+fn normalize_node_path(value: &str) -> Cow<'_, str> {
+    const VERBATIM_PREFIX: &str = "\\\\?\\";
+    const VERBATIM_UNC_PREFIX: &str = "\\\\?\\UNC\\";
+    if let Some(rest) = value.strip_prefix(VERBATIM_UNC_PREFIX) {
+        return Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value.strip_prefix(VERBATIM_PREFIX) {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+        {
+            return Cow::Borrowed(rest);
+        }
+    }
+    Cow::Borrowed(value)
+}
+
+fn node_compatible_path(path: &PathBuf) -> PathBuf {
+    path.to_str()
+        .map(normalize_node_path)
+        .map(|value| PathBuf::from(value.as_ref()))
+        .unwrap_or_else(|| path.clone())
+}
+
 async fn validate_node(executable: &OsString, expected_runtime: &str) -> Result<(), BoxError> {
     let output = Command::new(executable).arg("--version").output().await?;
     if !output.status.success() {
@@ -612,6 +639,7 @@ async fn start_worker(
     }
     let executable = configured_node(codebase);
     validate_node(&executable, &codebase.runtime).await?;
+    let node_source = node_compatible_path(&codebase.source);
     let mut command = Command::new(&executable);
     command.env_clear();
     for name in [
@@ -636,7 +664,7 @@ async fn start_worker(
         .env("FUNCTIONS_CODEBASE", &codebase.codebase)
         .arg(adapter)
         .arg("--source")
-        .arg(&codebase.source)
+        .arg(node_source)
         .arg("--project")
         .arg(&config.project_id)
         .current_dir(&codebase.source)
@@ -892,5 +920,22 @@ mod tests {
         assert_eq!(&value[4..5], "-");
         assert_eq!(&value[10..11], "T");
         assert!(value.ends_with(".000Z"));
+    }
+
+    #[test]
+    fn node_paths_normalize_only_windows_disk_and_unc_verbatim_prefixes() {
+        assert_eq!(
+            normalize_node_path(r"\\?\C:\release space\functions"),
+            r"C:\release space\functions"
+        );
+        assert_eq!(
+            normalize_node_path(r"\\?\UNC\server\share\functions"),
+            r"\\server\share\functions"
+        );
+        assert_eq!(
+            normalize_node_path(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\functions"),
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\functions"
+        );
+        assert_eq!(normalize_node_path("/tmp/functions"), "/tmp/functions");
     }
 }
