@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to test
+        required: true
+        type: string
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Rust and Functions checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            functions-runtime/package-lock.json
+            examples/node-app/package-lock.json
+            examples/web-app/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install locked Node test dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --ignore-scripts --prefix functions-runtime
+          npm ci --ignore-scripts --prefix examples/node-app
+          npm ci --ignore-scripts --prefix examples/web-app
+      - name: Test npm launcher
+        run: npm test
+      - name: Test Functions adapter
+        run: npm test --prefix functions-runtime
+      - name: Test Node example
+        run: npm test --prefix examples/node-app
+      - name: Test and build web example
+        run: |
+          npm test --prefix examples/web-app
+          npm run build --prefix examples/web-app
+      - name: Test automatic release planning and safety
+        run: python test/release_automation_test.py
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check Rust targets
+        run: cargo check --locked --all-targets
+      - name: Lint Rust targets
+        run: cargo clippy --locked --all-targets --no-deps
+      - name: Test Rust targets
+        run: cargo test --locked --all-targets

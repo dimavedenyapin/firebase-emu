@@ -1,0 +1,12 @@
+{
+  "name": "firebase-emu-compat",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "firebase-admin": "13.10.0"
+  },
+  "devDependencies": {
+    "firebase-tools": "15.29.0"
+  }
+}
+

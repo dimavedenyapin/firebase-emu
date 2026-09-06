@@ -1,0 +1,60 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// Modified for firebase-emu: reduced to the wire-compatible subset used here.
+
+syntax = "proto3";
+package google.firestore.v1;
+
+import "google/firestore/v1/common.proto";
+import "google/firestore/v1/document.proto";
+import "google/protobuf/timestamp.proto";
+
+message Write {
+  oneof operation {
+    Document update = 1;
+    string delete = 2;
+    DocumentTransform transform = 6;
+  }
+  DocumentMask update_mask = 3;
+  Precondition current_document = 4;
+  repeated DocumentTransform.FieldTransform update_transforms = 7;
+}
+
+message DocumentTransform {
+  string document = 1;
+  repeated FieldTransform field_transforms = 2;
+
+  message FieldTransform {
+    string field_path = 1;
+    oneof transform_type {
+      ServerValue set_to_server_value = 2;
+      Value increment = 3;
+      Value maximum = 4;
+      Value minimum = 5;
+      ArrayValue append_missing_elements = 6;
+      ArrayValue remove_all_from_array = 7;
+    }
+  }
+}
+
+enum ServerValue {
+  SERVER_VALUE_UNSPECIFIED = 0;
+  REQUEST_TIME = 1;
+}
+
+message WriteResult {
+  google.protobuf.Timestamp update_time = 1;
+  repeated Value transform_results = 2;
+}

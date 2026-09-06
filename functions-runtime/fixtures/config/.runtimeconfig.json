@@ -1,0 +1,8 @@
+{
+  "fixture": {
+    "nested": {
+      "enabled": true,
+      "limit": 7
+    }
+  }
+}

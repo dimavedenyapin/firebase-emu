@@ -1,0 +1,1 @@
+{"name":"synthetic-config-functions","private":true,"main":"index.cjs","engines":{"node":"22"},"dependencies":{"firebase-functions":"3.24.1","firebase-admin":"9.12.0"}}

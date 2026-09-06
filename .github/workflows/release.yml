@@ -1,0 +1,190 @@
+name: Release binaries
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to package
+        required: true
+        type: string
+      version:
+        description: Release version recorded in the source manifests
+        required: true
+        type: string
+      publish:
+        description: Create the tag and GitHub Release after all builds pass
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - id: version
+        name: Validate Cargo, npm, and tag versions
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version || '' }}
+        run: |
+          version="$(python scripts/package-release.py version ${REQUESTED_VERSION:+--version "$REQUESTED_VERSION"})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and smoke (${{ matrix.target }})
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/firebase-emu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/firebase-emu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/firebase-emu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/firebase-emu
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/firebase-emu.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: functions-runtime/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Install production Functions runtime
+        shell: bash
+        run: npm ci --omit=dev --ignore-scripts --prefix functions-runtime
+      - name: Build locked release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package release archive
+        shell: bash
+        env:
+          SOURCE_DATE_EPOCH: "0"
+        run: >-
+          python scripts/package-release.py package
+          --version "${{ needs.metadata.outputs.version }}"
+          --target "${{ matrix.target }}"
+          --binary "${{ matrix.binary }}"
+          --output dist
+      - name: Native binary and Functions smoke
+        shell: bash
+        run: >-
+          python scripts/package-release-smoke.py
+          --archive "dist/firebase-emu-v${{ needs.metadata.outputs.version }}-${{ matrix.target }}${{ endsWith(matrix.target, 'windows-msvc') && '.zip' || '.tar.gz' }}"
+          --repository "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firebase-emu-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  bundle:
+    name: Verify release bundle
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: firebase-emu-*
+          path: dist
+          merge-multiple: true
+      - name: Verify archives and write checksums
+        shell: bash
+        run: |
+          version="${{ needs.metadata.outputs.version }}"
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
+            python scripts/package-release.py verify \
+              --version "$version" \
+              --target "$target" \
+              --archive "dist/firebase-emu-v${version}-${target}.tar.gz"
+          done
+          python scripts/package-release.py verify \
+            --version "$version" \
+            --target x86_64-pc-windows-msvc \
+            --archive "dist/firebase-emu-v${version}-x86_64-pc-windows-msvc.zip"
+          python scripts/package-release.py checksums --version "$version" --directory dist
+          (cd dist && sha256sum --check "firebase-emu-v${version}-checksums.txt")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firebase-emu-v${{ needs.metadata.outputs.version }}-release-bundle
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: inputs.publish
+    needs: [metadata, build, bundle]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: firebase-emu-v${{ needs.metadata.outputs.version }}-release-bundle
+          path: dist
+      - name: Create an idempotent tag and publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ inputs.ref }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: bash scripts/publish-release.sh dist

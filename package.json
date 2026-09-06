@@ -1,0 +1,19 @@
+{
+  "name": "firebase-emu-rs",
+  "version": "0.1.0",
+  "description": "Local Firestore, Auth, Storage, and Functions emulator implemented in Rust",
+  "license": "Apache-2.0",
+  "repository": "github:dimavedenyapin/firebase-emu",
+  "bin": {
+    "firebase-emu": "bin/firebase-emu.cjs"
+  },
+  "scripts": {
+    "test": "node --test test/launcher.test.cjs"
+  },
+  "files": [
+    "bin/firebase-emu.cjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

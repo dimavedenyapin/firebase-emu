@@ -1,0 +1,8 @@
+{
+  "functions": [
+    {"name":"plainHttp","handler":"api","region":"asia-southeast1","trigger":{"type":"http"}},
+    {"name":"nestedHttp","handler":"nested.api","regions":["us-central1"],"trigger":{"type":"http"}},
+    {"name":"plainTopic","handler":"topic","trigger":{"type":"pubsub","topic":"fixture-topic"}},
+    {"name":"plainStorage","handler":"storage","trigger":{"type":"storage.finalize","bucket":"demo-functions.appspot.com"}}
+  ]
+}
