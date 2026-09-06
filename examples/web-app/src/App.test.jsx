@@ -1,0 +1,9 @@
+import React from 'react';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import App from './App';
+afterEach(cleanup);
+it('shows the returned document value', async () => { const client = { settings: { projectId: 'demo-test' }, read: vi.fn().mockResolvedValue({ title: 'Saved' }) }; render(<App client={client} />); fireEvent.click(screen.getByText('Read', { selector: 'button' })); await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Saved')); expect(client.read).toHaveBeenCalledWith('note-1'); });
+it('shows operation errors and enables controls again', async () => { const client = { settings: { projectId: 'demo-test' }, signIn: vi.fn().mockRejectedValue(new Error('Unsupported endpoint')) }; render(<App client={client} />); fireEvent.click(screen.getByText('Sign in')); await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Unsupported endpoint')); expect(screen.getByText('Sign in').disabled).toBe(false); });
+it('requires a file before upload', async () => { const upload = vi.fn(); render(<App client={{ settings: { projectId: 'demo-test' }, upload }} />); fireEvent.click(screen.getByText('Upload')); await waitFor(() => expect(screen.getByRole('status').textContent).toContain('Select a file')); expect(upload).not.toHaveBeenCalled(); });
+it('stops the listener when the component is removed', async () => { const stop = vi.fn(); const client = { settings: { projectId: 'demo-test' }, listen: vi.fn((id, next) => { next({ count: 2 }); return stop; }) }; const view = render(<App client={client} />); fireEvent.click(screen.getByText('Listen')); await waitFor(() => expect(screen.getByText('Listen').disabled).toBe(false)); view.unmount(); expect(stop).toHaveBeenCalledOnce(); });

@@ -1,0 +1,10 @@
+syntax = "proto3";
+package google.firestore.emulator.v1;
+
+import "google/protobuf/empty.proto";
+
+service FirestoreEmulator {
+  rpc ClearData(ClearDataRequest) returns (google.protobuf.Empty);
+}
+
+message ClearDataRequest { string database = 1; }

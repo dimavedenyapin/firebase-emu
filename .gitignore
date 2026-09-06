@@ -1,0 +1,8 @@
+/target/
+/compat/node_modules/
+/.firebase/
+/firebase-debug.log
+/*-debug.log
+
+**/node_modules/
+**/dist/

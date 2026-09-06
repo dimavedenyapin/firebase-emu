@@ -1,0 +1,149 @@
+syntax = "proto3";
+package google.firestore.v1;
+
+import "google/firestore/v1/common.proto";
+import "google/firestore/v1/document.proto";
+import "google/firestore/v1/query.proto";
+import "google/firestore/v1/write.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/rpc/status.proto";
+
+service Firestore {
+  rpc Listen(stream ListenRequest) returns (stream ListenResponse);
+  rpc GetDocument(GetDocumentRequest) returns (Document);
+  rpc CreateDocument(CreateDocumentRequest) returns (Document);
+  rpc UpdateDocument(UpdateDocumentRequest) returns (Document);
+  rpc DeleteDocument(DeleteDocumentRequest) returns (google.protobuf.Empty);
+  rpc BatchGetDocuments(BatchGetDocumentsRequest) returns (stream BatchGetDocumentsResponse);
+  rpc BeginTransaction(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rollback(RollbackRequest) returns (google.protobuf.Empty);
+  rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
+  rpc RunQuery(RunQueryRequest) returns (stream RunQueryResponse);
+}
+
+message BatchGetDocumentsRequest {
+  string database = 1;
+  repeated string documents = 2;
+  DocumentMask mask = 3;
+  oneof consistency_selector {
+    bytes transaction = 4;
+    TransactionOptions new_transaction = 5;
+    google.protobuf.Timestamp read_time = 7;
+  }
+}
+
+message BatchGetDocumentsResponse {
+  oneof result {
+    Document found = 1;
+    string missing = 2;
+  }
+  bytes transaction = 3;
+  google.protobuf.Timestamp read_time = 4;
+}
+
+message GetDocumentRequest {
+  string name = 1;
+  DocumentMask mask = 2;
+  oneof consistency_selector {
+    bytes transaction = 3;
+    google.protobuf.Timestamp read_time = 5;
+  }
+}
+
+message CreateDocumentRequest {
+  string parent = 1;
+  string collection_id = 2;
+  string document_id = 3;
+  Document document = 4;
+  DocumentMask mask = 5;
+}
+
+message UpdateDocumentRequest {
+  Document document = 1;
+  DocumentMask update_mask = 2;
+  DocumentMask mask = 3;
+  Precondition current_document = 4;
+}
+
+message DeleteDocumentRequest {
+  string name = 1;
+  Precondition current_document = 2;
+}
+
+message CommitRequest {
+  string database = 1;
+  repeated Write writes = 2;
+  bytes transaction = 3;
+}
+
+message BeginTransactionRequest {
+  string database = 1;
+  TransactionOptions options = 2;
+}
+
+message BeginTransactionResponse { bytes transaction = 1; }
+
+message RollbackRequest {
+  string database = 1;
+  bytes transaction = 2;
+}
+
+message CommitResponse {
+  repeated WriteResult write_results = 1;
+  google.protobuf.Timestamp commit_time = 2;
+}
+
+message BatchWriteRequest {
+  string database = 1;
+  repeated Write writes = 2;
+  map<string, string> labels = 3;
+}
+
+message BatchWriteResponse {
+  repeated WriteResult write_results = 1;
+  repeated google.rpc.Status status = 2;
+}
+
+message RunQueryRequest {
+  string parent = 1;
+  oneof query_type { StructuredQuery structured_query = 2; }
+  oneof consistency_selector {
+    bytes transaction = 5;
+    TransactionOptions new_transaction = 6;
+    google.protobuf.Timestamp read_time = 7;
+  }
+}
+
+message RunQueryResponse {
+  Document document = 1;
+  bytes transaction = 2;
+  google.protobuf.Timestamp read_time = 3;
+  int32 skipped_results = 4;
+  bool done = 6;
+}
+
+message ListenRequest {
+  string database = 1;
+  oneof target_change { Target add_target = 2; int32 remove_target = 3; }
+  map<string,string> labels = 4;
+}
+message Target {
+  message DocumentsTarget { repeated string documents = 2; }
+  message QueryTarget { string parent = 1; oneof query_type { StructuredQuery structured_query = 2; } }
+  oneof target_type { QueryTarget query = 2; DocumentsTarget documents = 3; }
+  oneof resume_type { bytes resume_token = 4; google.protobuf.Timestamp read_time = 11; }
+  int32 target_id = 5; bool once = 6;
+}
+message ListenResponse {
+  oneof response_type { TargetChange target_change = 2; DocumentChange document_change = 3; DocumentDelete document_delete = 4; DocumentRemove document_remove = 6; }
+}
+message TargetChange {
+  enum TargetChangeType { NO_CHANGE = 0; ADD = 1; REMOVE = 2; CURRENT = 3; RESET = 4; }
+  TargetChangeType target_change_type = 1; repeated int32 target_ids = 2;
+  google.rpc.Status cause = 3; bytes resume_token = 4; google.protobuf.Timestamp read_time = 6;
+}
+message DocumentChange { Document document = 1; repeated int32 target_ids = 5; repeated int32 removed_target_ids = 6; }
+message DocumentDelete { string document = 1; google.protobuf.Timestamp read_time = 4; repeated int32 removed_target_ids = 6; }
+message DocumentRemove { string document = 1; repeated int32 removed_target_ids = 2; google.protobuf.Timestamp read_time = 4; }

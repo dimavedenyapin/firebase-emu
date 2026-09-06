@@ -1,0 +1,7 @@
+{
+  "functions": {"source": "basic"},
+  "emulators": {
+    "functions": {"host": "127.0.0.1", "port": 15001},
+    "firestore": {"host": "127.0.0.1", "port": 18080}
+  }
+}

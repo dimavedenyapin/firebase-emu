@@ -1,0 +1,40 @@
+{
+  "node": [
+    "schema.currency.valid",
+    "schema.currency.invalid",
+    "firestore.create",
+    "firestore.read",
+    "firestore.partial-merge",
+    "firestore.where-order-limit",
+    "firestore.listener",
+    "firestore.batch-commit",
+    "firestore.list",
+    "firestore.delete",
+    "auth.createUser",
+    "auth.getUser",
+    "auth.updateUser",
+    "auth.listUsers",
+    "auth.deleteUser",
+    "storage.upload",
+    "storage.download",
+    "storage.list-prefix",
+    "storage.delete"
+  ],
+  "react": [
+    "schema.massActionType",
+    "schema.massActionType.invalid",
+    "auth.signUp",
+    "auth.signOut",
+    "auth.signIn",
+    "firestore.create",
+    "firestore.read",
+    "firestore.delete",
+    "firestore.partial-merge",
+    "firestore.where-order-limit",
+    "firestore.listener",
+    "storage.upload",
+    "storage.download",
+    "storage.list",
+    "storage.delete"
+  ]
+}

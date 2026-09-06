@@ -1,0 +1,24 @@
+syntax = "proto3";
+package google.firestore.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message DocumentMask { repeated string field_paths = 1; }
+
+message TransactionOptions {
+  message ReadWrite { bytes retry_transaction = 1; }
+  message ReadOnly {
+    oneof consistency_selector { google.protobuf.Timestamp read_time = 2; }
+  }
+  oneof mode {
+    ReadOnly read_only = 2;
+    ReadWrite read_write = 3;
+  }
+}
+
+message Precondition {
+  oneof condition_type {
+    bool exists = 1;
+    google.protobuf.Timestamp update_time = 2;
+  }
+}
