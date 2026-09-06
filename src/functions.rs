@@ -613,9 +613,21 @@ async fn start_worker(
     let executable = configured_node(codebase);
     validate_node(&executable, &codebase.runtime).await?;
     let mut command = Command::new(&executable);
+    command.env_clear();
+    for name in [
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "PATHEXT",
+        "COMSPEC",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .envs(config.child_environment())
         .env(
             "STORAGE_EMULATOR_HOST",
