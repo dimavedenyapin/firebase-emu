@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+const RESUMABLE_UPLOAD_TTL_SECS: u64 = 60 * 60;
+
 fn crc32c_base64(bytes: &[u8]) -> String {
     BASE64.encode(crc32c::crc32c(bytes).to_be_bytes())
 }
@@ -61,6 +63,19 @@ struct PendingUpload {
     name: String,
     metadata: UploadMetadata,
     bytes: Vec<u8>,
+    created_at: u64,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn prune_expired_uploads(data: &mut StorageData, now: u64) {
+    data.uploads
+        .retain(|_, upload| upload.created_at.saturating_add(RESUMABLE_UPLOAD_TTL_SECS) > now);
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -188,13 +203,17 @@ async fn upload_object(
                 metadata.content_type = header_string(&headers, "x-upload-content-type");
             }
             let id = Uuid::new_v4();
-            state.data.write().await.uploads.insert(
+            let mut data = state.data.write().await;
+            let now = unix_now();
+            prune_expired_uploads(&mut data, now);
+            data.uploads.insert(
                 id,
                 PendingUpload {
                     bucket: bucket.clone(),
                     name,
                     metadata,
                     bytes: Vec::new(),
+                    created_at: now,
                 },
             );
             let location = format!(
@@ -265,6 +284,7 @@ async fn resumable_put(
         None => return api_error(StatusCode::BAD_REQUEST, "missing upload_id"),
     };
     let mut data = state.data.write().await;
+    prune_expired_uploads(&mut data, unix_now());
     let pending = match data.uploads.get_mut(&id) {
         Some(upload) if upload.bucket == _bucket => upload,
         _ => return api_error(StatusCode::NOT_FOUND, "upload session not found"),
@@ -947,6 +967,7 @@ mod protocol_tests {
                 name: "file".into(),
                 metadata: UploadMetadata::default(),
                 bytes: Vec::new(),
+                created_at: unix_now(),
             },
         );
         for (offset, command, body, status) in [
@@ -982,5 +1003,25 @@ mod protocol_tests {
                 .as_ref(),
             b"onetwo"
         );
+    }
+
+    #[test]
+    fn abandoned_resumable_uploads_expire_opportunistically() {
+        let mut data = StorageData::default();
+        let expired = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        let upload = |created_at| PendingUpload {
+            bucket: "bucket".into(),
+            name: "file".into(),
+            metadata: UploadMetadata::default(),
+            bytes: Vec::new(),
+            created_at,
+        };
+        data.uploads.insert(expired, upload(1));
+        data.uploads
+            .insert(active, upload(RESUMABLE_UPLOAD_TTL_SECS + 1));
+        prune_expired_uploads(&mut data, RESUMABLE_UPLOAD_TTL_SECS + 2);
+        assert!(!data.uploads.contains_key(&expired));
+        assert!(data.uploads.contains_key(&active));
     }
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import peakfloSchema from 'peakflo-schema';
 import { connect } from '../src/sdk.mjs';
+import { validateCurrency } from '../src/app.mjs';
 
 const target = process.env.TARGET_NAME ?? 'configured-emulator';
 const strict = !process.argv.includes('--probe');
@@ -39,12 +39,8 @@ try {
   connection = connect(collection);
   const { app } = connection;
 
-  await check('schema', 'schema.currency.valid', () => {
-    assert.equal(peakfloSchema.currencyCodeSchema.required().validate('USD').value, 'USD');
-  });
-  await check('schema', 'schema.currency.invalid', () => {
-    assert.ok(peakfloSchema.currencyCodeSchema.required().validate('NOPE').error);
-  });
+  await check('fixture', 'fixture.currency.valid', () => assert.equal(validateCurrency('USD'), 'USD'));
+  await check('fixture', 'fixture.currency.invalid', () => assert.throws(() => validateCurrency('US')));
 
   await check('firestore', 'firestore.create', () => app.create('first', { label: 'First', rank: 1, currency: 'USD' }));
   await check('firestore', 'firestore.read', async () => {
@@ -138,7 +134,7 @@ try {
 const report = {
   sdk: 'node',
   target,
-  versions: { firebaseAdmin: '11.11.1', firestore: '7.11.6', storage: '7.7.0', peakfloSchema: '5.11.62' },
+  versions: { firebaseAdmin: '11.11.1', firestore: '7.11.6', storage: '7.7.0' },
   results
 };
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

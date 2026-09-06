@@ -1,7 +1,7 @@
 {
   "node": [
-    "schema.currency.valid",
-    "schema.currency.invalid",
+    "fixture.currency.valid",
+    "fixture.currency.invalid",
     "firestore.create",
     "firestore.read",
     "firestore.partial-merge",
@@ -21,8 +21,8 @@
     "storage.delete"
   ],
   "react": [
-    "schema.massActionType",
-    "schema.massActionType.invalid",
+    "fixture.actionType.valid",
+    "fixture.actionType.invalid",
     "auth.signUp",
     "auth.signOut",
     "auth.signIn",

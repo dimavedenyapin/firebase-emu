@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { MassActionType, validateMassActionType } from './schema';
+import { ActionType, validateActionType } from './schema';
 
-describe('Peakflo schema browser deep import', () => {
-  it('accepts a published mass action type', () => {
-    expect(validateMassActionType(MassActionType.TRANSACTION_UPDATE)).toBe('TRANSACTION_UPDATE');
+describe('synthetic input validator', () => {
+  it('accepts a known action type', () => {
+    expect(validateActionType(ActionType.UPDATE)).toBe('UPDATE');
   });
 
-  it('rejects values outside the published enum', () => {
-    expect(() => validateMassActionType('NOT_A_MASS_ACTION')).toThrow();
+  it('rejects an unknown action type', () => {
+    expect(() => validateActionType('UNKNOWN')).toThrow();
   });
 });

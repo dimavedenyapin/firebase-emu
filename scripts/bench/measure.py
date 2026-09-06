@@ -24,7 +24,6 @@ import sys
 import time
 from datetime import datetime, timezone
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)) + "/..")
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 BINARY = os.path.join(REPO, "target/release/firebase-emu")
 

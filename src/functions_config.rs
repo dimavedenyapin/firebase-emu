@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn rejects_production_projects_malformed_inputs_and_duplicate_codebases() {
         let fixture = base();
-        fixture.write(".firebaserc", r#"{"projects":{"default":"peakflo-prod"}}"#);
+        fixture.write(".firebaserc", r#"{"projects":{"default":"example-prod"}}"#);
         assert!(
             load(&fixture.0, &ConfigOverrides::default(), &BTreeMap::new())
                 .unwrap_err()

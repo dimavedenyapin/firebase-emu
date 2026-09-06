@@ -17,15 +17,19 @@ fi
 export GCLOUD_PROJECT="$project_id"
 export FIREBASE_PROJECT_ID="$project_id"
 export FIREBASE_CONFIG="{\"projectId\":\"$project_id\",\"storageBucket\":\"$project_id.appspot.com\"}"
-export FIRESTORE_EMULATOR_HOST="127.0.0.1:8080"
-export FIREBASE_AUTH_EMULATOR_HOST="127.0.0.1:9099"
-export FIREBASE_STORAGE_EMULATOR_HOST="127.0.0.1:9199"
-export STORAGE_EMULATOR_HOST="http://127.0.0.1:9199"
+: "${FIRESTORE_EMULATOR_HOST:=127.0.0.1:8080}"
+: "${FIREBASE_AUTH_EMULATOR_HOST:=127.0.0.1:9099}"
+: "${FIREBASE_STORAGE_EMULATOR_HOST:=127.0.0.1:9199}"
+: "${STORAGE_EMULATOR_HOST:=http://$FIREBASE_STORAGE_EMULATOR_HOST}"
+export FIRESTORE_EMULATOR_HOST FIREBASE_AUTH_EMULATOR_HOST FIREBASE_STORAGE_EMULATOR_HOST STORAGE_EMULATOR_HOST
+export FIRESTORE_EMU_PORT="${FIRESTORE_EMU_PORT:-${FIRESTORE_EMULATOR_HOST##*:}}"
+export FIREBASE_AUTH_EMU_PORT="${FIREBASE_AUTH_EMU_PORT:-${FIREBASE_AUTH_EMULATOR_HOST##*:}}"
+export FIREBASE_STORAGE_EMU_PORT="${FIREBASE_STORAGE_EMU_PORT:-${FIREBASE_STORAGE_EMULATOR_HOST##*:}}"
 export VITE_FIREBASE_projectId="$project_id"
-export VITE_FIRESTORE_EMULATOR_HOST="127.0.0.1:8080"
-export VITE_FIREBASE_AUTH_EMULATOR_HOST="http://127.0.0.1:9099"
+export VITE_FIRESTORE_EMULATOR_HOST="$FIRESTORE_EMULATOR_HOST"
+export VITE_FIREBASE_AUTH_EMULATOR_HOST="http://$FIREBASE_AUTH_EMULATOR_HOST"
 export VITE_FIREBASE_STORAGE_EMULATOR_HOST="127.0.0.1"
-export VITE_FIREBASE_STORAGE_EMULATOR_PORT="9199"
+export VITE_FIREBASE_STORAGE_EMULATOR_PORT="$FIREBASE_STORAGE_EMU_PORT"
 if [[ -z "${PLAYWRIGHT_CHROMIUM_EXECUTABLE:-}" ]]; then
   for candidate in "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-mac/headless_shell "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-mac-arm64/chrome-headless-shell; do
     if [[ -x "$candidate" ]]; then export PLAYWRIGHT_CHROMIUM_EXECUTABLE="$candidate"; fi
@@ -111,6 +115,9 @@ run_case matrix.unit local pass "$repo_dir" node --test compat-sdk/summarize.tes
 run_case rust.unit rust pass "$repo_dir" cargo test --all-targets
 run_case rust.build rust pass "$repo_dir" cargo build --release
 
+if [[ ! -d "$repo_dir/compat/node_modules" && "${SDK_COMPAT_INSTALL:-0}" == 1 ]]; then
+  run_case compat.install local pass "$repo_dir/compat" npm ci --ignore-scripts --no-audit --no-fund
+fi
 firebase_bin="${FIREBASE_BIN:-$repo_dir/compat/node_modules/.bin/firebase}"
 if [[ -n "${SDK_COMPAT_JAVA_HOME:-}" ]]; then
   export JAVA_HOME="$SDK_COMPAT_JAVA_HOME"
@@ -142,7 +149,7 @@ else
   trap 'kill "$rust_pid" 2>/dev/null || true' EXIT
   ready=0
   for _ in {1..100}; do
-    if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 8080 2>/dev/null && nc -z 127.0.0.1 9099 2>/dev/null && nc -z 127.0.0.1 9199 2>/dev/null; then
+    if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$FIRESTORE_EMU_PORT" 2>/dev/null && nc -z 127.0.0.1 "$FIREBASE_AUTH_EMU_PORT" 2>/dev/null && nc -z 127.0.0.1 "$FIREBASE_STORAGE_EMU_PORT" 2>/dev/null; then
       ready=1
       break
     fi
@@ -157,4 +164,4 @@ else
   wait "$rust_pid" 2>/dev/null || true
 fi
 
-node "$repo_dir/compat-sdk/summarize.mjs" "$results_dir" 
+node "$repo_dir/compat-sdk/summarize.mjs" "$results_dir"

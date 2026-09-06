@@ -10,7 +10,6 @@
     "test:integration": "node scripts/probe.mjs --strict"
   },
   "dependencies": {
-    "@peakflo/peakflo-schema": "4.11.58",
     "firebase": "12.12.1",
     "react": "16.14.0",
     "react-dom": "16.14.0"

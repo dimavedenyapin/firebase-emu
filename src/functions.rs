@@ -595,11 +595,21 @@ async fn start_worker(
     config: &FunctionsConfig,
     codebase: &FunctionCodebase,
 ) -> Result<(Worker, ManagedChild), BoxError> {
-    let adapter = std::env::var_os("FIREBASE_FUNCTIONS_ADAPTER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("functions-runtime/adapter.cjs")
-        });
+    let adapter = if let Some(path) = std::env::var_os("FIREBASE_FUNCTIONS_ADAPTER") {
+        PathBuf::from(path)
+    } else {
+        std::env::current_exe()?
+            .parent()
+            .ok_or("Firebase emulator executable has no parent directory")?
+            .join("functions-runtime/adapter.cjs")
+    };
+    if !adapter.is_file() {
+        return Err(format!(
+            "Functions runtime adapter not found at {}. Install functions-runtime next to the firebase-emu executable or set FIREBASE_FUNCTIONS_ADAPTER",
+            adapter.display()
+        )
+        .into());
+    }
     let executable = configured_node(codebase);
     validate_node(&executable, &codebase.runtime).await?;
     let mut command = Command::new(&executable);

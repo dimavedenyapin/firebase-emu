@@ -14,7 +14,6 @@
   "dependencies": {
     "@google-cloud/firestore": "7.11.6",
     "@google-cloud/storage": "7.7.0",
-    "firebase-admin": "11.11.1",
-    "peakflo-schema": "github:peakflo/peakflo-schema#v5.11.62"
+    "firebase-admin": "11.11.1"
   }
 }

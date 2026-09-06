@@ -1,37 +1,47 @@
-# Verified SDK matrix
+# SDK compatibility matrix
 
-Final run: 2026-09-06T11:55:44.265Z.
+The current public matrix contains 68 required assertions: 60 emulator I/O
+capabilities (17 Node and 13 browser checks against both targets) plus eight
+repeated generic input-validation checks (two Node and two browser checks per
+target). The validators replace the former private-schema assertions; they
+preserve harness coverage but are not emulator compatibility evidence. It uses
+only synthetic fixtures and locked public SDK dependencies. Missing,
+duplicate, failed, or blocked checks make the runner fail.
 
-| Target | Node | Browser | Failed | Blocked |
-| --- | ---: | ---: | ---: | ---: |
-| Google Firebase emulators | 19/19 | 15/15 | 0 | 0 |
-| Rust release | 19/19 | 15/15 | 0 | 0 |
-
-All 68 required SDK checks passed. All 13 runner cases passed. No checks were skipped or marked unsupported.
-
-- Rust regression tests: 41/41 passed.
-- Node unit tests: 5/5 passed.
-- Browser unit tests: 15/15 passed.
-- Matrix gate regression test: 1/1 passed.
-- Browser build and Rust release build: passed.
-- Installed SDK versions and lockfiles: passed.
-
-The browser listener test receives a write from a separate Firebase client. Both SDK suites check partial merge, where/order/limit, and live listener updates. Auth and Storage checks use actual SDK requests. The browser test runs in Chromium through Playwright, with no Admin proxy.
-
-Binary: `target/release/firebase-emu` (5714160 bytes).
-
-SHA-256: `8ea2dd7ba0628299b0bc2127d8150ce5f7c4cb28f8921ab18886058365971d70`.
-
-Functions integration is saved in commits `b345db2`, `6a58689`, and `eaf0150`; the recovered three-service base is `f10424a`.
-
-Run from the repository root:
+Run from a clean checkout:
 
 ```sh
+npm ci --prefix compat --ignore-scripts
+npm ci --prefix examples/node-app --ignore-scripts
+npm ci --prefix examples/web-app --ignore-scripts
+npx --prefix examples/web-app playwright install chromium
 ./scripts/sdk-compat.sh
 ```
 
-The runner checks the exact versions in `check-versions.mjs`, requires each check in `required-checks.json` once, and returns a nonzero exit for any failure, missing check, duplicate check, or blocked check. Unit tests use local test doubles. Integration tests use the real SDKs and emulator processes.
+Use Java 21 for the Google Firestore emulator. Set `FIREBASE_BIN`,
+`SDK_COMPAT_JAVA_HOME`, or `PLAYWRIGHT_CHROMIUM_EXECUTABLE` when automatic
+discovery is inappropriate. `SDK_COMPAT_INSTALL=1` asks the runner to install
+missing dependencies from committed lockfiles. Host and port environment
+variables may select isolated loopback ports for a Rust-only target run.
 
-Full command output and individual results are in `target/sdk-compat/summary.json`. The task artifact also preserves this JSON and the final report. The service is restricted to loopback and the SDK examples require demo projects. No production repository was changed and nothing was published.
+The last pre-cleanup run on 2026-09-06 passed the then-current 68-check matrix,
+45 Rust tests, 5 Node unit tests, 15 browser unit tests, and the browser/release
+builds. Separate historical application runs passed 18/18 and 11/11 checks.
+Those results describe the previous revision and are not reused as validation
+for this one.
 
-The supplied production application test suite was not available. These results prove the required pinned example matrix. See the root README for features outside that matrix.
+Fresh results for this revision must be generated with the commands above and
+are written to `target/sdk-compat/summary.json`; generated results are not
+committed. The covered operations include Firestore merge/transforms,
+where/order/limit and live listeners, browser and Admin Auth, and Node/browser
+Storage operations. See `unsupported.json` and the root README for deliberate
+limits.
+
+Local cleanup validation on 2026-09-06 used an isolated release build and
+ports 28080/28099/28199. The Rust target passed all 34/34 assertions (19 Node,
+15 browser): 30 emulator I/O checks and four generic fixture checks. The same
+revision passed Rust 47/47, Functions adapter 10/10, relocated full-binary 1/1,
+Node unit 5/5, browser unit 15/15, and matrix-gate 1/1; browser and Rust release
+builds also passed. The Google half was not rerun locally because the existing
+interactive stack owns its default ports; the native CI and manual compatibility
+workflows provide clean runners.

@@ -6,4 +6,8 @@ The service supports nested update masks, field deletion, quoted field paths, ma
 
 The strict Node SDK checks use direct `@google-cloud/firestore` 7.11.6. The strict browser checks use Firebase 12.12.1. Both must pass partial merge, where/order/limit, and a live listener update. Exact combined results are in `compat-sdk/README.md`.
 
-Firestore field transforms remain explicitly rejected. Production transaction isolation, Security Rules, composite index enforcement, aggregation, and partition queries are outside the verified scope.
+Numeric increment, array union/append-missing-elements, field deletion, and
+request-time/server-timestamp transforms are implemented. Maximum, minimum,
+array-remove, and other transforms return an explicit unsupported error.
+Production transaction isolation, Security Rules, composite index enforcement,
+aggregation, and partition queries are outside the verified scope.

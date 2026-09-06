@@ -28,10 +28,28 @@ fn environment_namespace() -> String {
 
 type UserTable = HashMap<String, BTreeMap<String, User>>;
 
+const ID_TOKEN_TTL_SECS: u64 = 60 * 60;
+const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    IdToken,
+    RefreshToken,
+}
+
+#[derive(Clone)]
+struct Session {
+    namespace: String,
+    uid: String,
+    issued_at: u64,
+    expires_at: u64,
+    kind: SessionKind,
+}
+
 #[derive(Clone)]
 struct AuthState {
     users: Arc<RwLock<UserTable>>,
-    sessions: Arc<RwLock<HashMap<String, (String, String, u64)>>>,
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_namespace: String,
 }
 
@@ -557,12 +575,18 @@ async fn delete_account(
     }
     let mut tables = state.users.write().await;
     let deleted = tables
-        .entry(namespace)
+        .entry(namespace.clone())
         .or_default()
         .remove(&request.local_id);
     if deleted.is_none() {
         return Err(ApiError::bad_request("USER_NOT_FOUND"));
     }
+    drop(tables);
+    state
+        .sessions
+        .write()
+        .await
+        .retain(|_, session| session.namespace != namespace || session.uid != request.local_id);
     Ok(Json(json!({})))
 }
 
@@ -903,7 +927,7 @@ async fn issue_session(state: &AuthState, namespace: &str, user: &User) -> Value
     if let Some(email) = &user.email {
         identities["email"] = json!([email]);
     }
-    let standard = json!({"iss":format!("https://securetoken.google.com/{project}"),"aud":project,"auth_time":now,"user_id":user.local_id,"sub":user.local_id,"iat":now,"exp":now+3600,"email_verified":user.email_verified,"firebase":{"identities":identities,"sign_in_provider":provider}});
+    let standard = json!({"iss":format!("https://securetoken.google.com/{project}"),"aud":project,"auth_time":now,"user_id":user.local_id,"sub":user.local_id,"iat":now,"exp":now+ID_TOKEN_TTL_SECS,"email_verified":user.email_verified,"firebase":{"identities":identities,"sign_in_provider":provider}});
     claims
         .as_object_mut()
         .unwrap()
@@ -921,27 +945,48 @@ async fn issue_session(state: &AuthState, namespace: &str, user: &User) -> Value
     );
     let refresh = Uuid::new_v4().to_string();
     let mut sessions = state.sessions.write().await;
+    sessions.retain(|_, session| session.expires_at > now);
     sessions.insert(
         token.clone(),
-        (namespace.into(), user.local_id.clone(), now),
+        Session {
+            namespace: namespace.into(),
+            uid: user.local_id.clone(),
+            issued_at: now,
+            expires_at: now + ID_TOKEN_TTL_SECS,
+            kind: SessionKind::IdToken,
+        },
     );
     sessions.insert(
         refresh.clone(),
-        (namespace.into(), user.local_id.clone(), now),
+        Session {
+            namespace: namespace.into(),
+            uid: user.local_id.clone(),
+            issued_at: now,
+            expires_at: now + REFRESH_TOKEN_TTL_SECS,
+            kind: SessionKind::RefreshToken,
+        },
     );
     json!({"localId":user.local_id,"email":user.email,"displayName":user.display_name,"idToken":token,"refreshToken":refresh,"expiresIn":"3600","registered":true})
 }
 
 async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result<User, ApiError> {
-    let (stored_namespace, uid, _) = state
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let session = state
         .sessions
         .read()
         .await
         .get(token)
         .cloned()
         .ok_or_else(|| ApiError::bad_request("INVALID_ID_TOKEN"))?;
-    if stored_namespace != namespace {
+    if session.kind != SessionKind::IdToken || session.namespace != namespace {
         return Err(ApiError::bad_request("INVALID_ID_TOKEN"));
+    }
+    if session.expires_at <= now {
+        state.sessions.write().await.remove(token);
+        return Err(ApiError::bad_request("TOKEN_EXPIRED"));
     }
     let claims = token
         .split('.')
@@ -949,10 +994,6 @@ async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result
         .and_then(|v| URL_SAFE_NO_PAD.decode(v).ok())
         .and_then(|v| serde_json::from_slice::<Value>(&v).ok())
         .ok_or_else(|| ApiError::bad_request("INVALID_ID_TOKEN"))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     if claims["exp"].as_u64().unwrap_or(0) <= now {
         return Err(ApiError::bad_request("TOKEN_EXPIRED"));
     }
@@ -961,7 +1002,7 @@ async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result
         .read()
         .await
         .get(namespace)
-        .and_then(|users| users.get(&uid))
+        .and_then(|users| users.get(&session.uid))
         .cloned()
         .ok_or_else(|| ApiError::bad_request("USER_NOT_FOUND"))?;
     if user.disabled {
@@ -986,13 +1027,23 @@ async fn refresh_token(
     if Uuid::parse_str(refresh).is_err() {
         return Err(ApiError::bad_request("INVALID_REFRESH_TOKEN"));
     }
-    let (namespace, uid, issued_at) = state
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let session = state
         .sessions
         .read()
         .await
         .get(refresh)
         .cloned()
         .ok_or_else(|| ApiError::bad_request("INVALID_REFRESH_TOKEN"))?;
+    if session.kind != SessionKind::RefreshToken || session.expires_at <= now {
+        state.sessions.write().await.remove(refresh);
+        return Err(ApiError::bad_request("INVALID_REFRESH_TOKEN"));
+    }
+    let namespace = session.namespace;
+    let uid = session.uid;
     let user = state
         .users
         .read()
@@ -1004,7 +1055,7 @@ async fn refresh_token(
     if user.disabled {
         return Err(ApiError::bad_request("USER_DISABLED"));
     }
-    if user.valid_since.parse::<u64>().unwrap_or(0) > issued_at {
+    if user.valid_since.parse::<u64>().unwrap_or(0) > session.issued_at {
         return Err(ApiError::bad_request("TOKEN_EXPIRED"));
     }
     let session = issue_session(&state, &namespace, &user).await;
@@ -1110,7 +1161,7 @@ mod session_tests {
         .unwrap();
         assert_eq!(
             session_user(&state, &ns, token).await.unwrap_err().message,
-            "USER_NOT_FOUND"
+            "INVALID_ID_TOKEN"
         );
     }
 
@@ -1256,5 +1307,44 @@ mod session_tests {
         .await
         .unwrap();
         assert!(list_users(&state, &ns, 10).await.is_empty());
+        assert!(state.sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_are_pruned_and_refresh_expiry_is_explicit() {
+        let state = AuthState::default();
+        let ns = state.default_namespace.clone();
+        let session = sign_up(State(state.clone()), Json(credentials("secret123")))
+            .await
+            .unwrap()
+            .0;
+        let id_token = session["idToken"].as_str().unwrap().to_owned();
+        let refresh = session["refreshToken"].as_str().unwrap().to_owned();
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.get_mut(&id_token).unwrap().expires_at = 0;
+            sessions.get_mut(&refresh).unwrap().expires_at = 0;
+        }
+        assert_eq!(
+            session_user(&state, &ns, &id_token)
+                .await
+                .unwrap_err()
+                .message,
+            "TOKEN_EXPIRED"
+        );
+        assert_eq!(
+            refresh_token(
+                State(state.clone()),
+                axum::Form(HashMap::from([
+                    ("grant_type".into(), "refresh_token".into()),
+                    ("refresh_token".into(), refresh),
+                ])),
+            )
+            .await
+            .unwrap_err()
+            .message,
+            "INVALID_REFRESH_TOKEN"
+        );
+        assert!(state.sessions.read().await.is_empty());
     }
 }

@@ -1,6 +1,6 @@
 {
   "features": [
-    {"feature": "Firestore field transforms, aggregation, partition queries, production transaction isolation, and Security Rules", "status": "outside-required-matrix"},
+    {"feature": "Firestore maximum/minimum/array-remove transforms, aggregation, partition queries, production transaction isolation, and Security Rules", "status": "outside-required-matrix"},
     {"feature": "Storage multi-chunk append/retry and IAM", "status": "outside-required-matrix"}
   ]
 }

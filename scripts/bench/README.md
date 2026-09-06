@@ -13,7 +13,7 @@ excluded from emulator totals.
 ## Reproduce (isolated ports 18280/18299/18399/18401)
 
 ```sh
-cd /Users/dmitryvedenyapin/Library/Application\ Support/20x/workspaces/asf9bjz95ra7kbjc6kn2155k/firebase-emu
+cd /path/to/firebase-emu
 python3 scripts/bench/measure.py --mode no-functions --idle-seconds 10 --out /tmp/bench-nofunc.jsonl --label idle-no-functions
 python3 scripts/bench/measure.py --mode functions --idle-seconds 15 --out /tmp/bench-func-idle.jsonl --label idle-functions
 python3 scripts/bench/measure.py --mode functions --workload "node scripts/bench/workload.mjs" --out /tmp/bench-load.jsonl --label load

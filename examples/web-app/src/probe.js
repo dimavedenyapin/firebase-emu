@@ -1,5 +1,5 @@
 import { bounded } from './config';
-import { MassActionType, validateMassActionType } from './schema';
+import { ActionType, validateActionType } from './schema';
 export async function runProbe(client) {
   const results = []; const id = `probe-${Date.now()}`; const email = `${id}@example.test`; const name = `${id}.txt`;
   async function check(name, action, dependency) {
@@ -9,10 +9,10 @@ export async function runProbe(client) {
     catch (error) { results.push({ name, status: 'failed', error: error.message, code: error.code || null, durationMs: Date.now() - start }); }
   }
   function assert(value, message) { if (!value) throw new Error(message); }
-  await check('schema.massActionType', () => assert(validateMassActionType(MassActionType.TRANSACTION_UPDATE) === 'TRANSACTION_UPDATE', 'Peakflo schema rejected a published enum value'));
-  await check('schema.massActionType.invalid', () => {
-    try { validateMassActionType('NOT_A_MASS_ACTION'); } catch { return; }
-    throw new Error('Peakflo schema accepted an invalid enum value');
+  await check('fixture.actionType.valid', () => assert(validateActionType(ActionType.UPDATE) === 'UPDATE', 'Synthetic action type was rejected'));
+  await check('fixture.actionType.invalid', () => {
+    try { validateActionType('UNKNOWN'); } catch { return; }
+    throw new Error('Unknown synthetic action type was accepted');
   });
   await check('auth.signUp', () => client.signUp(email, 'test-password'));
   await check('auth.signOut', () => client.signOut());
@@ -60,5 +60,5 @@ export async function runProbe(client) {
   await check('storage.list', async () => assert((await client.listFiles()).includes(name), 'Uploaded file is absent from list'), 'storage.upload');
   await check('storage.delete', () => client.deleteFile(name), 'storage.upload');
   await client.signOut();
-  return { sdk: 'firebase/browser', version: '12.12.1', schemaVersion: '4.11.58', projectId: client.settings.projectId, results };
+  return { sdk: 'firebase/browser', version: '12.12.1', projectId: client.settings.projectId, results };
 }

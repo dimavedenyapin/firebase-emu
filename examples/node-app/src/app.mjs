@@ -1,8 +1,9 @@
-import peakfloSchema from 'peakflo-schema';
-
-const { currencyCodeSchema } = peakfloSchema;
-
 // Dependency injection keeps unit checks separate from SDK compatibility checks.
+export function validateCurrency(value) {
+  if (typeof value !== 'string' || !/^[A-Z]{3}$/.test(value)) throw new Error('Currency must be a three-letter uppercase code');
+  return value;
+}
+
 export function createRecordApp({ db, auth, bucket, FieldValue }, collection = 'node-example') {
   const records = db.collection(collection);
   function ref(id) {
@@ -11,9 +12,7 @@ export function createRecordApp({ db, auth, bucket, FieldValue }, collection = '
   }
   function record(data) {
     if (!data || typeof data.label !== 'string' || !data.label.trim() || !Number.isFinite(data.rank)) throw new Error('A record needs a label and a finite rank');
-    const { error, value: currency } = currencyCodeSchema.required().validate(data.currency);
-    if (error) throw new Error(`Invalid Peakflo currency: ${error.message}`);
-    return { label: data.label.trim(), rank: data.rank, currency };
+    return { label: data.label.trim(), rank: data.rank, currency: validateCurrency(data.currency) };
   }
   return {
     async create(id, data) { await ref(id).create(record(data)); },

@@ -6,10 +6,10 @@ const {createServer} = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {chromium} = require('playwright');
 
 const repository = path.resolve(__dirname, '../..');
-const binary = path.join(repository, 'target/release/firebase-emu');
-const projectRoot = path.join(repository, 'functions-runtime/fixtures');
+const builtBinary = process.env.FIREBASE_EMU_BIN || path.join(repository, 'target/release/firebase-emu');
 const node22 = process.env.FIREBASE_FUNCTIONS_NODE_22 || process.execPath;
 
 async function freePort() {
@@ -29,17 +29,26 @@ async function waitFor(predicate, label, timeoutMs = 20000) {
 }
 
 test('release binary supervises Node22 and dispatches real SDK traffic', {timeout: 120000}, async t => {
-  assert.ok(fs.existsSync(binary), `release binary missing: ${binary}`);
+  assert.ok(fs.existsSync(builtBinary), `release binary missing: ${builtBinary}`);
   assert.ok(fs.existsSync(node22), `Node22 missing: ${node22}`);
   assert.equal(process.versions.node.split('.')[0], '22', 'run this test suite with Node 22');
-  const [functionsPort, firestorePort, authPort, storagePort, databasePort, pubsubPort, pagePort, debugPort] = await Promise.all(Array.from({length: 8}, freePort));
+  const [functionsPort, firestorePort, authPort, storagePort, databasePort, pubsubPort, pagePort] = await Promise.all(Array.from({length: 7}, freePort));
   const suffix = `${process.pid}-${Date.now()}`;
+  const distribution = fs.mkdtempSync(path.join(os.tmpdir(), 'firebase-emu-relocated-'));
+  const binary = path.join(distribution, process.platform === 'win32' ? 'firebase-emu.exe' : 'firebase-emu');
+  const runtime = path.join(distribution, 'functions-runtime');
+  const projectRoot = path.join(runtime, 'fixtures');
+  fs.mkdirSync(runtime);
+  fs.copyFileSync(builtBinary, binary);
+  if (process.platform !== 'win32') fs.chmodSync(binary, 0o755);
+  fs.copyFileSync(path.join(repository, 'functions-runtime/adapter.cjs'), path.join(runtime, 'adapter.cjs'));
+  fs.cpSync(path.join(repository, 'functions-runtime/node_modules'), path.join(runtime, 'node_modules'), {recursive: true});
+  fs.cpSync(path.join(repository, 'functions-runtime/fixtures'), projectRoot, {recursive: true});
   const eventLog = path.join(os.tmpdir(), `firebase-functions-events-${suffix}.jsonl`);
   const pidFile = path.join(os.tmpdir(), `firebase-functions-child-${suffix}.pid`);
   const configPidFile = path.join(os.tmpdir(), `firebase-functions-config-child-${suffix}.pid`);
   let stderr = '';
   let browser;
-  const browserProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'firebase-emu-brave-'));
   const staticServer = require('node:http').createServer((request, response) => {
     const bundles = {
       '/firebase-app.js': 'firebase-app-compat.js',
@@ -85,10 +94,7 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
   });
   child.stderr.on('data', chunk => { stderr += chunk; });
   t.after(async () => {
-    if (browser?.exitCode === null) {
-      browser.kill('SIGTERM');
-      await new Promise(resolve => browser.once('exit', resolve));
-    }
+    await browser?.close();
     await new Promise(resolve => staticServer.close(resolve));
     if (child.exitCode === null) {
       child.kill('SIGTERM');
@@ -97,7 +103,7 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
     for (const file of [eventLog, pidFile, configPidFile]) {
       try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
-    fs.rmSync(browserProfile, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    fs.rmSync(distribution, {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
   });
   await waitFor(() => stderr.includes(`Functions emulator ready on 127.0.0.1:${functionsPort}`), 'binary readiness');
   assert.ok(fs.existsSync(pidFile), stderr);
@@ -144,31 +150,17 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
   await db.doc('items/node').delete();
   await db.doc('async/waited').set({done: true});
 
-  browser = spawn('/Applications/Brave Browser.app/Contents/MacOS/Brave Browser', [
-    '--headless=new', '--no-first-run', '--disable-background-networking', '--disable-component-update',
-    `--remote-debugging-port=${debugPort}`, `--user-data-dir=${browserProfile}`, `http://127.0.0.1:${pagePort}/`,
-  ], {stdio: 'ignore'});
-  let page;
-  await waitFor(async () => {
-    try {
-      const pages = await (await fetch(`http://127.0.0.1:${debugPort}/json/list`)).json();
-      page = pages.find(item => item.type === 'page'); return Boolean(page);
-    } catch { return false; }
-  }, 'Brave DevTools page');
-  const socket = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
-  let commandId = 0;
-  const pending = new Map();
-  socket.addEventListener('message', event => { const message = JSON.parse(event.data); if (pending.has(message.id)) { pending.get(message.id)(message); pending.delete(message.id); } });
-  const cdp = (method, params = {}) => new Promise(resolve => { const id = ++commandId; pending.set(id, resolve); socket.send(JSON.stringify({id, method, params})); });
-  let browserResult;
-  await waitFor(async () => {
-    const message = await cdp('Runtime.evaluate', {expression: 'document.body.textContent', returnByValue: true});
-    const text = message.result?.result?.value;
-    if (!text?.startsWith('{')) return false;
-    browserResult = JSON.parse(text); return true;
-  }, 'browser Firebase SDK writes');
-  socket.close();
+  const browserExecutable = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  assert.ok(fs.existsSync(browserExecutable), `Chromium missing: ${browserExecutable}; run npx playwright install chromium or set PLAYWRIGHT_CHROMIUM_EXECUTABLE`);
+  browser = await chromium.launch({
+    executablePath: browserExecutable,
+    headless: true,
+    args: ['--no-first-run', '--disable-background-networking', '--disable-component-update'],
+  });
+  const page = await browser.newPage();
+  await page.goto(`http://127.0.0.1:${pagePort}/`);
+  await page.waitForFunction(() => document.body.textContent.startsWith('{'), null, {timeout: 20000});
+  const browserResult = JSON.parse(await page.textContent('body'));
   assert.equal(browserResult.ok, true, browserResult.error);
   assert.deepEqual(browserResult.callable.data, {from: 'browser'});
   assert.equal(browserResult.callable.uid, browserResult.authUid);

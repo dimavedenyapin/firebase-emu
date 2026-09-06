@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import peakfloSchema from 'peakflo-schema';
 import { Firestore } from '@google-cloud/firestore';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp } from 'firebase-admin/app';
@@ -42,7 +41,6 @@ test('current SDK entry points load with supported ESM import patterns', () => {
   assert.equal(typeof Storage, 'function');
   assert.equal(typeof initializeApp, 'function');
   assert.equal(typeof getAuth, 'function');
-  assert.equal(typeof peakfloSchema.currencyCodeSchema.validate, 'function');
 });
 
 test('configuration accepts explicit loopback emulator endpoints', () => {
@@ -70,12 +68,12 @@ test('configuration rejects production projects and remote endpoints', () => {
   }), /loopback/);
 });
 
-test('records are normalized and validated by the Peakflo schema', async () => {
+test('records are normalized and validated', async () => {
   const clients = fakeClients();
   const app = createRecordApp(clients);
   await app.create('one', { label: ' Example ', rank: 2, currency: 'USD' });
   assert.deepEqual(clients.writes[0], ['create', { label: 'Example', rank: 2, currency: 'USD' }]);
-  await assert.rejects(app.create('two', { label: 'Bad', rank: 2, currency: 'NOT_A_CURRENCY' }), /Invalid Peakflo currency/);
+  await assert.rejects(app.create('two', { label: 'Bad', rank: 2, currency: 'US' }), /three-letter uppercase/);
   await assert.rejects(app.create('bad/id', { label: 'Bad', rank: 2, currency: 'USD' }), /without \/$/);
 });
 

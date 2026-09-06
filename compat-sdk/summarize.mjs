@@ -40,10 +40,6 @@ const matrixCounts = Object.fromEntries(
 );
 const summary = {
   generatedAt: new Date().toISOString(),
-  references: {
-    peakfloWeb: '33390be512c6f4c531d5e10ec7bdf92fbe217523',
-    uploadFunctions: 'edeab8d9b6dae3a01077640e24c2178114c43c9d'
-  },
   counts,
   capabilityCounts,
   matrixCounts,
