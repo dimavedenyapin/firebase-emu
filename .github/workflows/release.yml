@@ -25,10 +25,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - id: version
@@ -70,13 +70,13 @@ jobs:
             binary: target/x86_64-pc-windows-msvc/release/firebase-emu.exe
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: functions-runtime/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Rust target
@@ -108,7 +108,7 @@ jobs:
           python scripts/package-release-smoke.py
           --archive "dist/firebase-emu-v${{ needs.metadata.outputs.version }}-${{ matrix.target }}${{ endsWith(matrix.target, 'windows-msvc') && '.zip' || '.tar.gz' }}"
           --repository "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firebase-emu-${{ matrix.target }}
           path: dist/*
@@ -120,11 +120,11 @@ jobs:
     needs: [metadata, build]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: firebase-emu-*
           path: dist
@@ -151,7 +151,7 @@ jobs:
             --archive "dist/firebase-emu-v${version}-x86_64-pc-windows-msvc.zip"
           python scripts/package-release.py checksums --version "$version" --directory dist
           (cd dist && sha256sum --check "firebase-emu-v${version}-checksums.txt")
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firebase-emu-v${{ needs.metadata.outputs.version }}-release-bundle
           path: dist/*
@@ -166,7 +166,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: firebase-emu-v${{ needs.metadata.outputs.version }}-release-bundle
           path: dist

@@ -18,19 +18,37 @@ jobs:
     name: Rust and Functions checks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: functions-runtime/package-lock.json
-      - name: Install Functions test dependencies
-        run: npm ci --ignore-scripts --prefix functions-runtime
+          cache-dependency-path: |
+            package-lock.json
+            functions-runtime/package-lock.json
+            examples/node-app/package-lock.json
+            examples/web-app/package-lock.json
+      - name: Install locked Node test dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --ignore-scripts --prefix functions-runtime
+          npm ci --ignore-scripts --prefix examples/node-app
+          npm ci --ignore-scripts --prefix examples/web-app
+      - name: Test npm launcher
+        run: npm test
+      - name: Test Functions adapter
+        run: npm test --prefix functions-runtime
+      - name: Test Node example
+        run: npm test --prefix examples/node-app
+      - name: Test and build web example
+        run: |
+          npm test --prefix examples/web-app
+          npm run build --prefix examples/web-app
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Check Rust targets
@@ -39,5 +57,3 @@ jobs:
         run: cargo clippy --locked --all-targets --no-deps
       - name: Test Rust targets
         run: cargo test --locked --all-targets
-      - name: Test Functions adapter
-        run: npm test --prefix functions-runtime
