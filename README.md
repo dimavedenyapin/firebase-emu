@@ -18,17 +18,46 @@ Release archives are built and smoke-tested natively for:
 Those are tested baselines, not claims of compatibility with older operating
 system or libc versions.
 
-After a `v0.1.0` release is published, Node 18+ users can run its verified
-prebuilt asset without installing Rust:
+Merging to `main` (or otherwise pushing a reviewed commit to `main`) starts an
+automatic release. The workflow records one synchronized source version, runs
+the required Rust/Node CI gates, builds and smoke-tests all five native targets,
+verifies the complete bundle, and only then publishes a normal, non-draft
+GitHub Release. No manually created tag or follow-up release PR is needed.
+
+The first merge publishes the current `0.1.0` version if `v0.1.0` is unused.
+After that, an unchanged or stale source version is advanced from the latest
+stable release by one patch (for example, `0.1.0` to `0.1.1`). To intentionally
+release a minor or major version, update all six version-bearing manifests in
+the same feature PR to a stable version greater than every existing release:
+`Cargo.toml`, the `firebase-emu` entry in `Cargo.lock`, the root `package.json`
+and root package in `package-lock.json`, plus the equivalent two files under
+`functions-runtime/`. Such a forward source version is honored; a version not
+greater than the latest release is overridden by the automatic patch policy.
+
+The automatic patch is a normal fast-forward `github-actions[bot]` commit on
+`main`, never a force push. It carries a source-commit marker so retries reuse
+the same version commit. Default-branch release runs are serialized, stale
+runs refuse to overwrite newer work, existing tags must already point to the
+exact built commit, and an existing published release must have byte-identical
+assets. GitHub's built-in `GITHUB_TOKEN` performs the commit, tag, and release;
+the build and publication remain in one workflow graph because a tag pushed by
+that token does not start another workflow. Repositories that later protect
+`main` must explicitly permit this ordinary version commit or choose a policy
+that accepts it; the workflow does not bypass branch protection or require a
+hidden PAT.
+
+Once `v0.1.0` is published, Node 18+ users can run its verified prebuilt asset
+without installing Rust:
 
 ```sh
 npx --yes github:dimavedenyapin/firebase-emu#v0.1.0 -- --no-functions
 ```
 
-The launcher downloads the matching GitHub Release archive, verifies it
+The launcher downloads the matching public GitHub Release archive, verifies it
 against the release SHA-256 manifest, caches it per version and target, and
 then forwards arguments without shell interpolation. An npm-registry package
-has not been published.
+has not been published, so `npx firebase-emu-rs` is not currently an npm
+installation path; the GitHub URL above is the supported `npx` relationship.
 
 Build from source with stable Rust when developing:
 

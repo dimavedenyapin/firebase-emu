@@ -2,9 +2,12 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to test
+        required: true
+        type: string
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -33,6 +38,9 @@ jobs:
             functions-runtime/package-lock.json
             examples/node-app/package-lock.json
             examples/web-app/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
       - name: Install locked Node test dependencies
         run: |
           npm ci --ignore-scripts
@@ -49,6 +57,8 @@ jobs:
         run: |
           npm test --prefix examples/web-app
           npm run build --prefix examples/web-app
+      - name: Test automatic release planning and safety
+        run: python test/release_automation_test.py
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Check Rust targets

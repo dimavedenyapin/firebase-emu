@@ -3,9 +3,21 @@ name: Release binaries
 on:
   pull_request:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to package
+        required: true
+        type: string
+      version:
+        description: Release version recorded in the source manifests
+        required: true
+        type: string
+      publish:
+        description: Create the tag and GitHub Release after all builds pass
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
@@ -27,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
@@ -35,16 +48,10 @@ jobs:
         name: Validate Cargo, npm, and tag versions
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          REQUESTED_VERSION: ${{ inputs.version || '' }}
         run: |
-          version="$(python scripts/package-release.py version)"
+          version="$(python scripts/package-release.py version ${REQUESTED_VERSION:+--version "$REQUESTED_VERSION"})"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Require release tags to point at reviewed default-branch history
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: >-
-          git merge-base --is-ancestor "$GITHUB_SHA"
-          "origin/${{ github.event.repository.default_branch }}"
 
   build:
     name: Build and smoke (${{ matrix.target }})
@@ -71,6 +78,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -94,7 +103,6 @@ jobs:
       - name: Package release archive
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           SOURCE_DATE_EPOCH: "0"
         run: >-
           python scripts/package-release.py package
@@ -121,6 +129,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -131,8 +141,6 @@ jobs:
           merge-multiple: true
       - name: Verify archives and write checksums
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           version="${{ needs.metadata.outputs.version }}"
           for target in \
@@ -160,21 +168,23 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: inputs.publish
     needs: [metadata, build, bundle]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           name: firebase-emu-v${{ needs.metadata.outputs.version }}-release-bundle
           path: dist
-      - name: Publish versioned assets after every native build passed
+      - name: Create an idempotent tag and publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}" dist/*
-          --repo "${{ github.repository }}"
-          --verify-tag
-          --generate-notes
+          RELEASE_COMMIT: ${{ inputs.ref }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: bash scripts/publish-release.sh dist

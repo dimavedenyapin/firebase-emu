@@ -1,0 +1,76 @@
+name: Automatic release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: automatic-release-${{ github.repository }}-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan and record release version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      ref: ${{ steps.result.outputs.ref }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - id: plan
+        name: Select first, patch, or intentional source version
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python scripts/release-version.py plan
+      - name: Commit synchronized version manifests
+        if: steps.plan.outputs.changed == 'true'
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock package.json package-lock.json \
+            functions-runtime/package.json functions-runtime/package-lock.json
+          git diff --cached --check
+          git commit -m "Release v${VERSION}" \
+            -m "Firebase-Emu-Release-Source: ${SOURCE_SHA}"
+          git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"
+      - id: result
+        name: Export immutable release commit
+        run: echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Required CI gates
+    needs: plan
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.plan.outputs.ref }}
+
+  release:
+    name: Build, smoke, and publish five native binaries
+    needs: [plan, quality]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.plan.outputs.ref }}
+      version: ${{ needs.plan.outputs.version }}
+      publish: true
