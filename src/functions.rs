@@ -38,8 +38,9 @@ use tokio::{
 use tower_http::cors::{Any, CorsLayer};
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
-const TRIGGER_LOOP_LIMIT: usize = 1000;
+const DIRECT_TRIGGER_LOOP_LIMIT: usize = 1000;
 const DURABLE_BURST_LIMIT: usize = 32;
+const DURABLE_BURST_PAUSE_MS: u64 = 10;
 const FAILURE_HISTORY_LIMIT: usize = 1000;
 const TRANSITION_RETRIES: usize = 5;
 const OUTBOX_LEASE_SECONDS: i64 = 5;
@@ -54,6 +55,15 @@ struct Hub {
     sequence: AtomicU64,
     failures: Mutex<Vec<Value>>,
     completed: AtomicU64,
+    #[cfg(test)]
+    dispatch_hook: Mutex<Option<TestDispatchHook>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestDispatchHook {
+    observed: tokio::sync::mpsc::UnboundedSender<i64>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 fn record_failure(hub: &Hub, event_id: Option<i64>, error: impl Into<String>) {
@@ -82,17 +92,32 @@ fn clear_system_failures(hub: &Hub) {
         .retain(|failure| !failure["eventId"].is_null());
 }
 
-fn trigger_loop_limit() -> usize {
-    std::env::var("FIREBASE_EMU_TEST_TRIGGER_LOOP_LIMIT")
+fn durable_burst_limit() -> usize {
+    std::env::var("FIREBASE_EMU_TEST_DURABLE_BURST_LIMIT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0 && *value <= TRIGGER_LOOP_LIMIT)
-        .unwrap_or(TRIGGER_LOOP_LIMIT)
+        .filter(|value| *value > 0 && *value <= DURABLE_BURST_LIMIT)
+        .unwrap_or(DURABLE_BURST_LIMIT)
 }
 
-fn queue_poll_delay(has_persistence: bool, durable_burst: usize) -> Duration {
-    if has_persistence && durable_burst >= DURABLE_BURST_LIMIT {
-        Duration::ZERO
+fn durable_burst_pause() -> Duration {
+    Duration::from_millis(
+        std::env::var("FIREBASE_EMU_TEST_DURABLE_BURST_PAUSE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0 && *value <= 1_000)
+            .unwrap_or(DURABLE_BURST_PAUSE_MS),
+    )
+}
+
+fn queue_poll_delay(
+    has_persistence: bool,
+    durable_burst: usize,
+    burst_limit: usize,
+    burst_pause: Duration,
+) -> Duration {
+    if has_persistence && durable_burst >= burst_limit {
+        burst_pause
     } else {
         Duration::from_millis(250)
     }
@@ -536,7 +561,6 @@ struct DurableRow {
     source: String,
     payload: Vec<u8>,
     attempts: i64,
-    has_queued_successor: bool,
 }
 
 fn decode_durable(row: &DurableRow) -> Result<QueuedEvent, String> {
@@ -583,26 +607,6 @@ fn decode_durable(row: &DurableRow) -> Result<QueuedEvent, String> {
     })
 }
 
-fn durable_chain_key(event: &QueuedEvent) -> String {
-    match &event.source {
-        EventSource::Firestore { before, after } => format!(
-            "firestore:{}",
-            after
-                .as_ref()
-                .or(before.as_ref())
-                .map(|document| document.name.as_str())
-                .unwrap_or_default()
-        ),
-        EventSource::Storage { kind, object } => format!(
-            "storage:{kind}:{}:{}",
-            object["bucket"].as_str().unwrap_or_default(),
-            object["name"].as_str().unwrap_or_default()
-        ),
-        EventSource::PubSub { topic, .. } => format!("pubsub:{topic}"),
-        EventSource::Schedule { function } => format!("schedule:{function}"),
-    }
-}
-
 async fn recover_outbox(persistence: &Persistence) -> Result<(), String> {
     persistence
         .write(|connection| {
@@ -624,10 +628,7 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
             let now = unix_now_i64();
             let row = {
                 let mut statement = transaction.prepare(
-                    "SELECT candidate.id, candidate.source, candidate.payload, candidate.attempts, \
-                            EXISTS(SELECT 1 FROM event_outbox AS successor \
-                                   WHERE successor.id > candidate.id \
-                                     AND successor.state IN ('pending','in_flight')) \
+                    "SELECT candidate.id, candidate.source, candidate.payload, candidate.attempts \
                      FROM event_outbox AS candidate \
                      WHERE (candidate.state='pending' AND candidate.available_at <= ?1) \
                         OR (candidate.state='in_flight' AND candidate.lease_until IS NOT NULL \
@@ -641,7 +642,6 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
                             source: row.get(1)?,
                             payload: row.get(2)?,
                             attempts: row.get(3)?,
-                            has_queued_successor: row.get(4)?,
                         })
                     })
                     .optional()?
@@ -764,31 +764,6 @@ async fn fail_outbox_with_retry(
     Err(last)
 }
 
-async fn terminal_fail_outbox(
-    persistence: &Persistence,
-    id: i64,
-    message: String,
-) -> Result<(), String> {
-    persistence
-        .write(move |connection| {
-            let transaction = connection.transaction()?;
-            transaction.execute(
-                "UPDATE event_outbox SET state='failed', lease_until=NULL, last_error=?2 \
-                 WHERE id=?1 AND state='in_flight'",
-                rusqlite::params![id, message],
-            )?;
-            transaction.execute(
-                "DELETE FROM event_outbox WHERE state='failed' AND id NOT IN \
-                 (SELECT id FROM event_outbox WHERE state='failed' ORDER BY id DESC LIMIT 1000)",
-                [],
-            )?;
-            transaction.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| error.to_string())
-}
-
 fn unix_now_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -802,45 +777,30 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
             record_failure(&runtime.hub, None, error);
         }
     }
-    let mut durable_tail_key: Option<String> = None;
-    let mut durable_tail_count = 0;
     let mut direct_busy_count = 0;
     let mut durable_burst = 0;
-    let loop_limit = trigger_loop_limit();
+    let burst_limit = durable_burst_limit();
+    let burst_pause = durable_burst_pause();
     loop {
-        if durable_burst < DURABLE_BURST_LIMIT {
+        if durable_burst < burst_limit {
             if let Some(persistence) = &runtime.hub.persistence {
                 match claim_outbox(persistence).await {
                     Ok(Some(row)) => {
                         clear_system_failures(&runtime.hub);
                         durable_burst += 1;
-                        let decoded = decode_durable(&row);
-                        let chain_key = decoded.as_ref().ok().map(durable_chain_key);
-                        let next_tail_count = if row.has_queued_successor {
-                            0
-                        } else if chain_key.is_some() && chain_key == durable_tail_key {
-                            durable_tail_count + 1
-                        } else {
-                            1
-                        };
-                        if next_tail_count > loop_limit {
-                            let error = format!(
-                                "self-trigger chain limit exceeded ({loop_limit} matching tail events)"
-                            );
-                            if let Err(persistence_error) =
-                                terminal_fail_outbox(persistence, row.id, error).await
-                            {
-                                record_failure(&runtime.hub, Some(row.id), persistence_error);
-                            }
-                            durable_tail_key = None;
-                            durable_tail_count = 0;
-                            durable_burst = 0;
-                            continue;
-                        }
-                        let result = match decoded {
+                        let result = match decode_durable(&row) {
                             Ok(event) => runtime.dispatch(&event).await,
                             Err(error) => Err(error),
                         };
+                        #[cfg(test)]
+                        let dispatch_hook = { runtime.hub.dispatch_hook.lock().unwrap().clone() };
+                        #[cfg(test)]
+                        if let Some(hook) = dispatch_hook {
+                            let _ = hook.observed.send(row.id);
+                            if let Ok(permit) = hook.release.acquire().await {
+                                permit.forget();
+                            }
+                        }
                         if let Err(error) = result {
                             match fail_outbox_with_retry(persistence, &row, error).await {
                                 Ok(()) => clear_event_failures(&runtime.hub, row.id),
@@ -861,19 +821,10 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
                                 Err(error) => record_failure(&runtime.hub, Some(row.id), error),
                             }
                         }
-                        if row.has_queued_successor {
-                            durable_tail_key = None;
-                            durable_tail_count = 0;
-                        } else {
-                            durable_tail_key = chain_key;
-                            durable_tail_count = next_tail_count;
-                        }
                         continue;
                     }
                     Ok(None) => {
                         clear_system_failures(&runtime.hub);
-                        durable_tail_key = None;
-                        durable_tail_count = 0;
                         durable_burst = 0;
                     }
                     Err(error) => {
@@ -883,11 +834,29 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
                 }
             }
         }
-        let wait = queue_poll_delay(runtime.hub.persistence.is_some(), durable_burst);
-        let message = tokio::select! {
-            biased;
-            message=rx.recv()=>message,
-            _=tokio::time::sleep(wait)=>Some(QueueMessage::DurableWake),
+        let throttled = runtime.hub.persistence.is_some() && durable_burst >= burst_limit;
+        let wait = queue_poll_delay(
+            runtime.hub.persistence.is_some(),
+            durable_burst,
+            burst_limit,
+            burst_pause,
+        );
+        let message = if throttled {
+            tokio::time::sleep(wait).await;
+            let mut direct = None;
+            while let Ok(message) = rx.try_recv() {
+                if matches!(message, QueueMessage::Direct(_)) {
+                    direct = Some(message);
+                    break;
+                }
+            }
+            direct.or(Some(QueueMessage::DurableWake))
+        } else {
+            tokio::select! {
+                biased;
+                message=rx.recv()=>message,
+                _=tokio::time::sleep(wait)=>Some(QueueMessage::DurableWake),
+            }
         };
         let Some(message) = message else { break };
         let QueueMessage::Direct(event) = message else {
@@ -896,9 +865,10 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
         };
         durable_burst = 0;
         direct_busy_count += 1;
-        let result = if direct_busy_count > loop_limit {
+        let result = if direct_busy_count > DIRECT_TRIGGER_LOOP_LIMIT {
             Err(format!(
-                "trigger loop limit exceeded ({loop_limit} events without an idle queue)"
+                "trigger loop limit exceeded ({} events without an idle queue)",
+                DIRECT_TRIGGER_LOOP_LIMIT
             ))
         } else {
             runtime.dispatch(&event).await
@@ -1325,6 +1295,8 @@ pub(crate) async fn serve(
         sequence: AtomicU64::new(0),
         failures: Mutex::new(vec![]),
         completed: AtomicU64::new(0),
+        #[cfg(test)]
+        dispatch_hook: Mutex::new(None),
     });
     HUB.set(hub.clone())
         .map_err(|_| "Functions already started")?;
@@ -1372,6 +1344,7 @@ mod tests {
                 sequence: AtomicU64::new(0),
                 failures: Mutex::new(vec![]),
                 completed: AtomicU64::new(0),
+                dispatch_hook: Mutex::new(None),
             }),
         }
     }
@@ -1392,10 +1365,29 @@ mod tests {
                     sequence: AtomicU64::new(0),
                     failures: Mutex::new(vec![]),
                     completed: AtomicU64::new(0),
+                    dispatch_hook: Mutex::new(None),
                 }),
             },
             rx,
         )
+    }
+
+    async fn insert_same_resource_test_event(persistence: &Persistence) -> i64 {
+        let document = Document {
+            name: "projects/demo-functions/databases/(default)/documents/backlog/shared".into(),
+            ..Default::default()
+        };
+        let records = document_outbox_record(None, Some(&document));
+        let persistence_for_write = persistence.clone();
+        persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let ids = persistence_for_write.insert_outbox(&transaction, &records)?;
+                transaction.commit()?;
+                Ok(ids[0])
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1480,45 +1472,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn independent_backlog_above_loop_limit_is_fully_delivered() {
+    async fn same_resource_writes_injected_during_dispatch_are_all_delivered() {
         let _test_guard = TEST_OUTBOX_QUEUE_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!(
-            "firebase-emu-outbox-independent-backlog-{}",
+            "firebase-emu-outbox-live-independent-writes-{}",
             uuid::Uuid::new_v4()
         ));
         let persistence = Persistence::open(root.clone(), true).await.unwrap();
-        let backlog = TRIGGER_LOOP_LIMIT + 5;
-        // Use the same resource key for every row: the pre-existing successor
-        // rows, not path diversity, prove this is an ordinary backlog rather
-        // than a handler creating the next tail event.
-        let records: Vec<OutboxRecord> = (0..backlog)
-            .flat_map(|_| {
-                let document = Document {
-                    name: "projects/demo-functions/databases/(default)/documents/backlog/shared"
-                        .into(),
-                    ..Default::default()
-                };
-                document_outbox_record(None, Some(&document))
-            })
-            .collect();
-        let persistence_for_write = persistence.clone();
-        persistence
-            .write(move |connection| {
-                let transaction = connection.transaction()?;
-                let ids = persistence_for_write.insert_outbox(&transaction, &records)?;
-                assert_eq!(ids.len(), backlog);
-                transaction.commit()?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
+        let deliveries = DIRECT_TRIGGER_LOOP_LIMIT + 5;
+        insert_same_resource_test_event(&persistence).await;
         let (runtime, rx) = persistent_test_runtime(persistence.clone());
+        let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *runtime.hub.dispatch_hook.lock().unwrap() = Some(TestDispatchHook {
+            observed,
+            release: release.clone(),
+        });
         let queue = tokio::spawn(run_queue(runtime.clone(), rx));
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let mut ids = BTreeSet::new();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            for index in 0..deliveries {
+                let id = observations.recv().await.expect("dispatch observation");
+                assert!(ids.insert(id), "each independent event dispatches once");
+                if index + 1 < deliveries {
+                    // Insert the next independent write after the current row
+                    // was claimed and dispatched, but before its ACK. This is
+                    // the exact timing that a key/tail heuristic misclassified.
+                    insert_same_resource_test_event(&persistence).await;
+                }
+                release.add_permits(1);
+            }
             loop {
                 let status = runtime.status().await;
-                if status["pending"] == 0 && status["completed"] == backlog as u64 {
+                if status["pending"] == 0 && status["completed"] == deliveries as u64 {
                     assert_eq!(status["failures"], json!([]));
                     break;
                 }
@@ -1527,6 +1513,7 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(ids.len(), deliveries);
         let states = persistence
             .read(|connection| {
                 let active: i64 = connection.query_row(
@@ -1573,11 +1560,15 @@ mod tests {
 
     #[test]
     fn in_memory_queue_keeps_its_bounded_idle_poll() {
+        let pause = Duration::from_millis(DURABLE_BURST_PAUSE_MS);
         assert_eq!(
-            queue_poll_delay(false, DURABLE_BURST_LIMIT),
+            queue_poll_delay(false, DURABLE_BURST_LIMIT, DURABLE_BURST_LIMIT, pause),
             Duration::from_millis(250)
         );
-        assert_eq!(queue_poll_delay(true, DURABLE_BURST_LIMIT), Duration::ZERO);
+        assert_eq!(
+            queue_poll_delay(true, DURABLE_BURST_LIMIT, DURABLE_BURST_LIMIT, pause),
+            pause
+        );
     }
 
     #[tokio::test]
