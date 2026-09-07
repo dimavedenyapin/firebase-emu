@@ -119,7 +119,12 @@ second process using the same directory.
 Supported Firestore and Storage triggers use a durable outbox when Functions
 are configured. Pending/in-flight work is recovered after restart, stable event
 IDs are retried up to five times with bounded backoff, and terminal failures are
-reported by Functions status/drain. Delivery is at least once: a crash after a
+reported by Functions status/drain. Failed durable state transitions are
+retried immediately, and an expired five-second delivery lease is reclaimable
+without restarting the process. Direct Pub/Sub/schedule work is checked after
+at most 32 durable deliveries. A self-triggering chain is stopped and surfaced
+as failed after 1,000 uninterrupted durable events. Delivery is at least once:
+a crash after a
 handler succeeds but before its durable acknowledgement can deliver the same
 event ID again, and one source event targeting several handlers can repeat the
 whole matching group. Exactly-once delivery is not promised. Starting with

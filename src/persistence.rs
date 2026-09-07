@@ -60,7 +60,7 @@ struct Inner {
     blobs: PathBuf,
     temporary: PathBuf,
     writer: mpsc::Sender<WriteRequest>,
-    readers: Semaphore,
+    readers: Arc<Semaphore>,
     events_enabled: bool,
     _owner_lock: File,
 }
@@ -123,7 +123,7 @@ impl Persistence {
             blobs,
             temporary,
             writer,
-            readers: Semaphore::new(MAX_READERS),
+            readers: Arc::new(Semaphore::new(MAX_READERS)),
             events_enabled,
             _owner_lock: owner_lock,
         })))
@@ -170,22 +170,28 @@ impl Persistence {
     pub(crate) async fn read<R, F>(&self, operation: F) -> Result<R, Error>
     where
         R: Send + 'static,
-        F: FnOnce(&Connection) -> Result<R, Error> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<R, Error> + Send + 'static,
     {
-        let permit = self
-            .0
+        let inner = self.0.clone();
+        let permit = inner
             .readers
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| Error::WriterStopped)?;
-        let database = self.0.database.clone();
+        let database = inner.database.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let connection = open_read_connection(&database)?;
-            operation(&connection)
+            // The owned permit and Inner stay in the blocking job even if the
+            // async caller is cancelled. That keeps both the eight-reader
+            // bound and the data-directory ownership lock valid until the
+            // SQLite work has actually stopped.
+            let _permit = permit;
+            let _inner = inner;
+            let mut connection = open_read_connection(&database)?;
+            operation(&mut connection)
         })
         .await
         .map_err(|error| Error::Join(error.to_string()))?;
-        drop(permit);
         result
     }
 
@@ -326,6 +332,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn temporary(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("firebase-emu-{name}-{}", uuid::Uuid::new_v4()))
@@ -349,6 +356,65 @@ mod tests {
         let error = Persistence::open(root.clone(), true).await.unwrap_err();
         assert!(matches!(error, Error::AlreadyOwned(_)));
         drop(first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+    async fn cancelled_reads_keep_the_blocking_worker_bound() {
+        let root = temporary("cancelled-read-bound");
+        let persistence = Persistence::open(root.clone(), false).await.unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let mut tasks = Vec::new();
+        for _ in 0..(MAX_READERS * 3) {
+            let persistence = persistence.clone();
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let started = started.clone();
+            let release = release.clone();
+            tasks.push(tokio::spawn(async move {
+                persistence
+                    .read(move |_| {
+                        let live = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(live, Ordering::SeqCst);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.load(Ordering::SeqCst) != MAX_READERS {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for task in &tasks {
+            task.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), MAX_READERS);
+        assert_eq!(maximum.load(Ordering::SeqCst), MAX_READERS);
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), persistence.read(|_| Ok(())))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(persistence);
         fs::remove_dir_all(root).unwrap();
     }
 

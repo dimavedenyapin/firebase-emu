@@ -38,6 +38,9 @@ fn crc32c_base64(bytes: &[u8]) -> String {
 struct StorageState {
     data: Arc<RwLock<StorageData>>,
     persistence: Option<Persistence>,
+    blob_lifecycle: Arc<RwLock<()>>,
+    #[cfg(test)]
+    media_read_barrier: Option<Arc<std::sync::Barrier>>,
 }
 
 #[derive(Default)]
@@ -549,6 +552,7 @@ async fn save_object(
     if let Some(persistence) = &state.persistence {
         return save_persistent_object(
             persistence.clone(),
+            state.blob_lifecycle.clone(),
             bucket,
             name,
             bytes,
@@ -593,6 +597,7 @@ async fn save_object(
 
 async fn save_persistent_object(
     persistence: Persistence,
+    blob_lifecycle: Arc<RwLock<()>>,
     bucket: String,
     name: String,
     bytes: Bytes,
@@ -639,6 +644,11 @@ async fn save_persistent_object(
     let content_encoding = metadata.content_encoding;
     let persistence_for_write = persistence.clone();
     let committed_blob_name = blob_name.clone();
+    // Readers hold the shared side of this guard from metadata selection
+    // through the final byte read. Keep the exclusive side through commit and
+    // old-file cleanup so no acknowledged generation can disappear beneath a
+    // GET, including on Windows where an open file may reject unlinking.
+    let _blob_guard = blob_lifecycle.write().await;
     let result = persistence
         .write(move |connection| {
             let transaction = connection.transaction()?;
@@ -771,11 +781,49 @@ async fn load_blob(
     Ok(Bytes::from(bytes))
 }
 
+async fn persistent_media(
+    state: &StorageState,
+    bucket: String,
+    name: String,
+) -> Result<Option<StoredObject>, PersistenceError> {
+    let _blob_guard = state.blob_lifecycle.read().await;
+    let Some(mut object) = persistent_object(
+        state
+            .persistence
+            .as_ref()
+            .expect("persistent Storage state"),
+        bucket,
+        name,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    if let Some(barrier) = &state.media_read_barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+    object.bytes = Some(
+        load_blob(
+            state
+                .persistence
+                .as_ref()
+                .expect("persistent Storage state"),
+            &object,
+        )
+        .await?,
+    );
+    Ok(Some(object))
+}
+
 async fn delete_persistent_object(
     persistence: Persistence,
+    blob_lifecycle: Arc<RwLock<()>>,
     bucket: String,
     name: String,
 ) -> Response {
+    let _blob_guard = blob_lifecycle.write().await;
     let persistence_for_write = persistence.clone();
     let result = persistence
         .write(move |connection| {
@@ -842,16 +890,14 @@ async fn get_object(
     Query(query): Query<ObjectQuery>,
 ) -> Response {
     if let Some(persistence) = &state.persistence {
+        if query.alt.as_deref() == Some("media") {
+            return match persistent_media(&state, bucket, object).await {
+                Ok(Some(object)) => media_response(object),
+                Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
+                Err(error) => persistence_failure(error),
+            };
+        }
         return match persistent_object(persistence, bucket, object).await {
-            Ok(Some(mut object)) if query.alt.as_deref() == Some("media") => {
-                match load_blob(persistence, &object).await {
-                    Ok(bytes) => {
-                        object.bytes = Some(bytes);
-                        media_response(object)
-                    }
-                    Err(error) => persistence_failure(error),
-                }
-            }
             Ok(Some(object)) => Json(object_json(&object)).into_response(),
             Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
             Err(error) => persistence_failure(error),
@@ -875,15 +921,9 @@ async fn get_signed_object(
     State(state): State<StorageState>,
     Path((bucket, object)): Path<(String, String)>,
 ) -> Response {
-    if let Some(persistence) = &state.persistence {
-        return match persistent_object(persistence, bucket, object).await {
-            Ok(Some(mut object)) => match load_blob(persistence, &object).await {
-                Ok(bytes) => {
-                    object.bytes = Some(bytes);
-                    media_response(object)
-                }
-                Err(error) => persistence_failure(error),
-            },
+    if state.persistence.is_some() {
+        return match persistent_media(&state, bucket, object).await {
+            Ok(Some(object)) => media_response(object),
             Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
             Err(error) => persistence_failure(error),
         };
@@ -938,7 +978,13 @@ async fn delete_object(
     Path((bucket, object)): Path<(String, String)>,
 ) -> Response {
     if let Some(persistence) = &state.persistence {
-        return delete_persistent_object(persistence.clone(), bucket, object).await;
+        return delete_persistent_object(
+            persistence.clone(),
+            state.blob_lifecycle.clone(),
+            bucket,
+            object,
+        )
+        .await;
     }
     let removed = state.data.write().await.objects.remove(&(bucket, object));
     if let Some(object) = removed {
@@ -1500,6 +1546,104 @@ mod tests {
         );
         drop(third_state);
         drop(third_store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persistent_media_reads_hold_blob_through_overwrite_and_delete() {
+        let root = temporary("media-lifetime");
+        let (persistence, mut state) = persistent_state(&root).await;
+        assert_eq!(
+            save_object(
+                &state,
+                "bucket".into(),
+                "file.bin".into(),
+                Bytes::from_static(b"first"),
+                UploadMetadata::default(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let overwrite_barrier = Arc::new(std::sync::Barrier::new(2));
+        state.media_read_barrier = Some(overwrite_barrier.clone());
+        let rest_get = tokio::spawn(get_object(
+            State(state.clone()),
+            Path(("bucket".into(), "file.bin".into())),
+            Query(ObjectQuery {
+                alt: Some("media".into()),
+            }),
+        ));
+        tokio::task::spawn_blocking({
+            let barrier = overwrite_barrier.clone();
+            move || barrier.wait()
+        })
+        .await
+        .unwrap();
+        let overwrite = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                save_object(
+                    &state,
+                    "bucket".into(),
+                    "file.bin".into(),
+                    Bytes::from_static(b"second"),
+                    UploadMetadata::default(),
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!overwrite.is_finished());
+        tokio::task::spawn_blocking(move || overwrite_barrier.wait())
+            .await
+            .unwrap();
+        let response = rest_get.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            b"first".as_slice()
+        );
+        assert_eq!(overwrite.await.unwrap().status(), StatusCode::OK);
+
+        let delete_barrier = Arc::new(std::sync::Barrier::new(2));
+        state.media_read_barrier = Some(delete_barrier.clone());
+        let signed_get = tokio::spawn(get_signed_object(
+            State(state.clone()),
+            Path(("bucket".into(), "file.bin".into())),
+        ));
+        tokio::task::spawn_blocking({
+            let barrier = delete_barrier.clone();
+            move || barrier.wait()
+        })
+        .await
+        .unwrap();
+        let delete = tokio::spawn(delete_object(
+            State(state.clone()),
+            Path(("bucket".into(), "file.bin".into())),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!delete.is_finished());
+        tokio::task::spawn_blocking(move || delete_barrier.wait())
+            .await
+            .unwrap();
+        let response = signed_get.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            b"second".as_slice()
+        );
+        assert_eq!(delete.await.unwrap().status(), StatusCode::NO_CONTENT);
+
+        drop(state);
+        drop(persistence);
         let _ = fs::remove_dir_all(root);
     }
 

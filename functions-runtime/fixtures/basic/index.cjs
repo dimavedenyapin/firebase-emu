@@ -14,6 +14,15 @@ exports.create=functions.firestore.document('items/{itemId}').onCreate((snap,ctx
 exports.remove=functions.firestore.document('items/{itemId}').onDelete((snap,ctx)=>record('remove',{data:snap.data(),param:ctx.params.itemId,exists:snap.exists}));
 exports.update=functions.firestore.document('items/{itemId}').onUpdate((change,ctx)=>record('update',{before:change.before.data(),after:change.after.data(),param:ctx.params.itemId}));
 exports.asyncCreate=functions.firestore.document('async/{itemId}').onCreate(async(snap,ctx)=>{await new Promise(r=>setTimeout(r,75));return record('asyncCreate',{data:snap.data(),param:ctx.params.itemId});});
+exports.selfLoop=functions.firestore.document('loop/{itemId}').onWrite(async(change,ctx)=>{
+ const current=change.after.exists?(change.after.data().n||0):0;
+ record('selfLoop',{eventId:ctx.eventId,n:current});
+ const host=process.env.FIRESTORE_EMULATOR_HOST;
+ const project=process.env.GCLOUD_PROJECT;
+ const url=`http://${host}/v1/projects/${project}/databases/(default)/documents:commit`;
+ const response=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({writes:[{update:{name:`projects/${project}/databases/(default)/documents/loop/${ctx.params.itemId}`,fields:{n:{integerValue:String(current+1)}}}}]})});
+ if(!response.ok) throw Error(`self loop write failed: ${response.status} ${await response.text()}`);
+});
 exports.eventFail=functions.firestore.document('bad/{id}').onWrite(async()=>{throw Error('event failure');});
 exports.topic=functions.pubsub.topic('fixture-topic').onPublish(message=>record('topic',{json:message.json,attributes:message.attributes}));
 exports.schedule=functions.pubsub.schedule('every 5 minutes').onRun(ctx=>record('schedule',{eventId:ctx.eventId}));

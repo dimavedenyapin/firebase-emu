@@ -91,6 +91,8 @@ pub(crate) struct FirestoreService {
     pub(crate) store: Arc<Mutex<Store>>,
     changes: broadcast::Sender<()>,
     persistence: Option<crate::persistence::Persistence>,
+    #[cfg(test)]
+    batch_get_barrier: Option<Arc<std::sync::Barrier>>,
 }
 impl Default for FirestoreService {
     fn default() -> Self {
@@ -98,6 +100,8 @@ impl Default for FirestoreService {
             store: Default::default(),
             changes: broadcast::channel(128).0,
             persistence: None,
+            #[cfg(test)]
+            batch_get_barrier: None,
         }
     }
 }
@@ -419,19 +423,31 @@ impl FirestoreService {
     pub(crate) async fn documents(&self, names: &[String]) -> Result<Vec<Document>, Status> {
         if let Some(persistence) = &self.persistence {
             let names = names.to_vec();
+            #[cfg(test)]
+            let barrier = self.batch_get_barrier.clone();
             persistence
                 .read(move |connection| {
+                    let transaction = connection.transaction()?;
                     let mut documents = Vec::new();
-                    let mut statement = connection
+                    let mut statement = transaction
                         .prepare("SELECT document FROM firestore_documents WHERE name=?1")?;
-                    for name in names {
+                    for (_index, name) in names.into_iter().enumerate() {
                         let bytes = statement
                             .query_row(params![name], |row| row.get::<_, Vec<u8>>(0))
                             .optional()?;
                         if let Some(bytes) = bytes {
                             documents.push(decode_document(0, bytes)?);
                         }
+                        #[cfg(test)]
+                        if _index == 0 {
+                            if let Some(barrier) = &barrier {
+                                barrier.wait();
+                                barrier.wait();
+                            }
+                        }
                     }
+                    drop(statement);
+                    transaction.commit()?;
                     Ok(documents)
                 })
                 .await
@@ -813,17 +829,23 @@ impl Firestore for FirestoreService {
             validate_document_name(name)?;
         }
         let read_time = timestamp_now();
-        let mut store = self.store.lock().await;
-        let new_transaction = match request.consistency_selector.as_ref() {
-            Some(batch_get_documents_request::ConsistencySelector::Transaction(transaction)) => {
-                validate_transaction(&store, &request.database, transaction)?;
-                None
-            }
-            Some(batch_get_documents_request::ConsistencySelector::NewTransaction(_)) => {
-                database_document_prefix(&request.database)?;
-                Some(create_transaction(&mut store, request.database.clone()))
-            }
-            _ => None,
+        let (new_transaction, in_memory_documents) = {
+            let mut store = self.store.lock().await;
+            let new_transaction = match request.consistency_selector.as_ref() {
+                Some(batch_get_documents_request::ConsistencySelector::Transaction(
+                    transaction,
+                )) => {
+                    validate_transaction(&store, &request.database, transaction)?;
+                    None
+                }
+                Some(batch_get_documents_request::ConsistencySelector::NewTransaction(_)) => {
+                    database_document_prefix(&request.database)?;
+                    Some(create_transaction(&mut store, request.database.clone()))
+                }
+                _ => None,
+            };
+            let documents = self.persistence.is_none().then(|| store.documents.clone());
+            (new_transaction, documents)
         };
         let persistent_documents = if self.persistence.is_some() {
             Some(
@@ -842,7 +864,8 @@ impl Firestore for FirestoreService {
             .map(|name| {
                 let result = persistent_documents
                     .as_ref()
-                    .unwrap_or(&store.documents)
+                    .or(in_memory_documents.as_ref())
+                    .expect("one Firestore backend supplies documents")
                     .get(&name)
                     .cloned()
                     .map(batch_get_documents_response::Result::Found)
@@ -864,7 +887,6 @@ impl Firestore for FirestoreService {
         if let (Some(transaction), Some(Ok(first))) = (new_transaction, responses.first_mut()) {
             first.transaction = transaction;
         }
-        drop(store);
         Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
     }
 
@@ -1656,6 +1678,104 @@ mod tests {
             .unwrap();
         assert!(service.document(&default_name).await.unwrap().is_none());
         assert!(service.document(&other_name).await.unwrap().is_some());
+        drop(service);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persistent_batch_get_uses_one_snapshot_during_atomic_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "firebase-emu-firestore-batch-snapshot-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persistence = crate::persistence::Persistence::open(root.clone(), false)
+            .await
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut service = FirestoreService::new(Some(persistence.clone()));
+        service.batch_get_barrier = Some(barrier.clone());
+        let first = format!("{ROOT}/items/a");
+        let second = format!("{ROOT}/items/b");
+        service
+            .commit(Request::new(CommitRequest {
+                database: "projects/test/databases/(default)".into(),
+                writes: vec![
+                    Write {
+                        operation: Some(write::Operation::Update(document(&first, 1))),
+                        ..Default::default()
+                    },
+                    Write {
+                        operation: Some(write::Operation::Update(document(&second, 1))),
+                        ..Default::default()
+                    },
+                ],
+                transaction: Vec::new(),
+            }))
+            .await
+            .unwrap();
+
+        let reader = {
+            let service = service.clone();
+            let first = first.clone();
+            let second = second.clone();
+            tokio::spawn(async move {
+                service
+                    .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                        database: "projects/test/databases/(default)".into(),
+                        documents: vec![first, second],
+                        mask: None,
+                        consistency_selector: None,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .collect::<Vec<_>>()
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking({
+            let barrier = barrier.clone();
+            move || barrier.wait()
+        })
+        .await
+        .unwrap();
+
+        service
+            .commit(Request::new(CommitRequest {
+                database: "projects/test/databases/(default)".into(),
+                writes: vec![
+                    Write {
+                        operation: Some(write::Operation::Update(document(&first, 2))),
+                        ..Default::default()
+                    },
+                    Write {
+                        operation: Some(write::Operation::Update(document(&second, 2))),
+                        ..Default::default()
+                    },
+                ],
+                transaction: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || barrier.wait())
+            .await
+            .unwrap();
+
+        let responses = reader.await.unwrap();
+        let values: Vec<i64> = responses
+            .into_iter()
+            .map(|response| match response.unwrap().result.unwrap() {
+                batch_get_documents_response::Result::Found(document) => {
+                    match document.fields["value"].value_type {
+                        Some(google::firestore::v1::value::ValueType::IntegerValue(value)) => value,
+                        _ => panic!("expected integer"),
+                    }
+                }
+                _ => panic!("expected document"),
+            })
+            .collect();
+        assert_eq!(values, vec![1, 1]);
         drop(service);
         drop(persistence);
         std::fs::remove_dir_all(root).unwrap();

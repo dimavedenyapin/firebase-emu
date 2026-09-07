@@ -1376,7 +1376,8 @@ async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result
         let token = token.to_owned();
         let found = persistence
             .read(move |connection| {
-                let session = connection
+                let transaction = connection.transaction()?;
+                let session = transaction
                     .query_row(
                         "SELECT namespace,uid,issued_at,expires_at,kind FROM auth_sessions WHERE token=?1",
                         rusqlite::params![token],
@@ -1392,9 +1393,10 @@ async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result
                     )
                     .optional()?;
                 let user = match &session {
-                    Some(session) => load_user(connection, &namespace, &session.uid)?,
+                    Some(session) => load_user(&transaction, &namespace, &session.uid)?,
                     None => None,
                 };
+                transaction.commit()?;
                 Ok((session, user))
             })
             .await

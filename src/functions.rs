@@ -38,6 +38,13 @@ use tokio::{
 use tower_http::cors::{Any, CorsLayer};
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
+const TRIGGER_LOOP_LIMIT: usize = 1000;
+const DURABLE_BURST_LIMIT: usize = 32;
+const FAILURE_HISTORY_LIMIT: usize = 1000;
+const TRANSITION_RETRIES: usize = 5;
+const OUTBOX_LEASE_SECONDS: i64 = 5;
+#[cfg(test)]
+static TEST_ACK_FAILURES: AtomicUsize = AtomicUsize::new(0);
 struct Hub {
     tx: mpsc::Sender<QueueMessage>,
     persistence: Option<Persistence>,
@@ -45,6 +52,48 @@ struct Hub {
     sequence: AtomicU64,
     failures: Mutex<Vec<Value>>,
     completed: AtomicU64,
+}
+
+fn record_failure(hub: &Hub, event_id: Option<i64>, error: impl Into<String>) {
+    let failure = json!({"eventId":event_id,"error":error.into()});
+    let mut failures = hub.failures.lock().unwrap();
+    if failures.iter().any(|existing| existing == &failure) {
+        return;
+    }
+    if failures.len() >= FAILURE_HISTORY_LIMIT {
+        failures.remove(0);
+    }
+    failures.push(failure);
+}
+
+fn clear_event_failures(hub: &Hub, event_id: i64) {
+    hub.failures
+        .lock()
+        .unwrap()
+        .retain(|failure| failure["eventId"].as_i64() != Some(event_id));
+}
+
+fn clear_system_failures(hub: &Hub) {
+    hub.failures
+        .lock()
+        .unwrap()
+        .retain(|failure| !failure["eventId"].is_null());
+}
+
+fn trigger_loop_limit() -> usize {
+    std::env::var("FIREBASE_EMU_TEST_TRIGGER_LOOP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0 && *value <= TRIGGER_LOOP_LIMIT)
+        .unwrap_or(TRIGGER_LOOP_LIMIT)
+}
+
+fn queue_poll_delay(has_persistence: bool, durable_burst: usize) -> Duration {
+    if has_persistence && durable_burst >= DURABLE_BURST_LIMIT {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(250)
+    }
 }
 #[derive(Clone)]
 struct QueuedEvent {
@@ -86,10 +135,7 @@ fn enqueue(source: EventSource) -> Result<u64, String> {
     {
         hub.pending.fetch_sub(1, Ordering::SeqCst);
         let message = format!("trigger queue rejected event: {error}");
-        hub.failures
-            .lock()
-            .unwrap()
-            .push(json!({"eventId":id,"error":message}));
+        record_failure(hub, Some(id as i64), message.clone());
         return Err(message);
     }
     Ok(id)
@@ -556,7 +602,9 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
             let row = {
                 let mut statement = transaction.prepare(
                     "SELECT id, source, payload, attempts FROM event_outbox \
-                     WHERE state='pending' AND available_at <= ?1 ORDER BY id LIMIT 1",
+                     WHERE (state='pending' AND available_at <= ?1) \
+                        OR (state='in_flight' AND lease_until IS NOT NULL AND lease_until <= ?1) \
+                     ORDER BY id LIMIT 1",
                 )?;
                 statement
                     .query_row([now], |row| {
@@ -573,7 +621,7 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
                 transaction.execute(
                     "UPDATE event_outbox SET state='in_flight', attempts=attempts+1, \
                      lease_until=?2 WHERE id=?1",
-                    rusqlite::params![row.id, now + 60],
+                    rusqlite::params![row.id, now + OUTBOX_LEASE_SECONDS],
                 )?;
             }
             transaction.commit()?;
@@ -587,14 +635,28 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
 }
 
 async fn acknowledge_outbox(persistence: &Persistence, id: i64) -> Result<(), String> {
+    #[cfg(test)]
+    if TEST_ACK_FAILURES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return Err("injected durable acknowledgement failure".into());
+    }
     persistence
         .write(move |connection| {
             let transaction = connection.transaction()?;
-            transaction.execute(
+            let updated = transaction.execute(
                 "UPDATE event_outbox SET state='delivered', delivered_at=unixepoch(), \
                  lease_until=NULL, last_error=NULL WHERE id=?1 AND state='in_flight'",
                 [id],
             )?;
+            if updated != 1 {
+                return Err(crate::persistence::Error::Corrupt(format!(
+                    "durable event {id} is not in flight during acknowledgement"
+                )));
+            }
             transaction.execute(
                 "UPDATE counters SET value=value+1 WHERE name='event_completed'",
                 [],
@@ -609,6 +671,18 @@ async fn acknowledge_outbox(persistence: &Persistence, id: i64) -> Result<(), St
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn acknowledge_outbox_with_retry(persistence: &Persistence, id: i64) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..TRANSITION_RETRIES {
+        match acknowledge_outbox(persistence, id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(10 << attempt)).await;
+    }
+    Err(last)
 }
 
 async fn fail_outbox(
@@ -645,6 +719,47 @@ async fn fail_outbox(
         .map_err(|error| error.to_string())
 }
 
+async fn fail_outbox_with_retry(
+    persistence: &Persistence,
+    row: &DurableRow,
+    message: String,
+) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..TRANSITION_RETRIES {
+        match fail_outbox(persistence, row, message.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+        tokio::time::sleep(Duration::from_millis(10 << attempt)).await;
+    }
+    Err(last)
+}
+
+async fn terminal_fail_outbox(
+    persistence: &Persistence,
+    id: i64,
+    message: String,
+) -> Result<(), String> {
+    persistence
+        .write(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE event_outbox SET state='failed', lease_until=NULL, last_error=?2 \
+                 WHERE id=?1 AND state='in_flight'",
+                rusqlite::params![id, message],
+            )?;
+            transaction.execute(
+                "DELETE FROM event_outbox WHERE state='failed' AND id NOT IN \
+                 (SELECT id FROM event_outbox WHERE state='failed' ORDER BY id DESC LIMIT 1000)",
+                [],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
 fn unix_now_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -655,84 +770,98 @@ fn unix_now_i64() -> i64 {
 async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
     if let Some(persistence) = &runtime.hub.persistence {
         if let Err(error) = recover_outbox(persistence).await {
-            runtime
-                .hub
-                .failures
-                .lock()
-                .unwrap()
-                .push(json!({"eventId":null,"error":error}));
+            record_failure(&runtime.hub, None, error);
         }
     }
-    let mut busy_count = 0;
+    let mut durable_busy_count = 0;
+    let mut direct_busy_count = 0;
+    let mut durable_burst = 0;
+    let loop_limit = trigger_loop_limit();
     loop {
-        if let Some(persistence) = &runtime.hub.persistence {
-            match claim_outbox(persistence).await {
-                Ok(Some(row)) => {
-                    let result = match decode_durable(&row) {
-                        Ok(event) => runtime.dispatch(&event).await,
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = result {
-                        if let Err(persistence_error) =
-                            fail_outbox(persistence, &row, error.clone()).await
-                        {
-                            runtime.hub.failures.lock().unwrap().push(json!({
-                                "eventId": row.id,
-                                "error": persistence_error
-                            }));
+        if durable_burst < DURABLE_BURST_LIMIT {
+            if let Some(persistence) = &runtime.hub.persistence {
+                match claim_outbox(persistence).await {
+                    Ok(Some(row)) => {
+                        clear_system_failures(&runtime.hub);
+                        durable_busy_count += 1;
+                        durable_burst += 1;
+                        if durable_busy_count > loop_limit {
+                            let error = format!(
+                            "trigger loop limit exceeded ({loop_limit} events without an idle queue)"
+                        );
+                            if let Err(persistence_error) =
+                                terminal_fail_outbox(persistence, row.id, error).await
+                            {
+                                record_failure(&runtime.hub, Some(row.id), persistence_error);
+                            }
+                            durable_busy_count = 0;
+                            durable_burst = 0;
+                            continue;
                         }
-                    } else {
-                        if let Some(delay) = std::env::var("FIREBASE_EMU_TEST_OUTBOX_ACK_DELAY_MS")
-                            .ok()
-                            .and_then(|value| value.parse::<u64>().ok())
-                        {
-                            tokio::time::sleep(Duration::from_millis(delay.min(60_000))).await;
+                        let result = match decode_durable(&row) {
+                            Ok(event) => runtime.dispatch(&event).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = result {
+                            match fail_outbox_with_retry(persistence, &row, error).await {
+                                Ok(()) => clear_event_failures(&runtime.hub, row.id),
+                                Err(persistence_error) => {
+                                    record_failure(&runtime.hub, Some(row.id), persistence_error)
+                                }
+                            }
+                        } else {
+                            if let Some(delay) =
+                                std::env::var("FIREBASE_EMU_TEST_OUTBOX_ACK_DELAY_MS")
+                                    .ok()
+                                    .and_then(|value| value.parse::<u64>().ok())
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay.min(60_000))).await;
+                            }
+                            match acknowledge_outbox_with_retry(persistence, row.id).await {
+                                Ok(()) => clear_event_failures(&runtime.hub, row.id),
+                                Err(error) => record_failure(&runtime.hub, Some(row.id), error),
+                            }
                         }
-                        if let Err(error) = acknowledge_outbox(persistence, row.id).await {
-                            runtime
-                                .hub
-                                .failures
-                                .lock()
-                                .unwrap()
-                                .push(json!({"eventId":row.id,"error":error}));
-                        }
+                        continue;
                     }
-                    continue;
+                    Ok(None) => {
+                        clear_system_failures(&runtime.hub);
+                        durable_busy_count = 0;
+                        durable_burst = 0;
+                    }
+                    Err(error) => {
+                        record_failure(&runtime.hub, None, error);
+                        durable_burst = 0;
+                    }
                 }
-                Ok(None) => {}
-                Err(error) => runtime
-                    .hub
-                    .failures
-                    .lock()
-                    .unwrap()
-                    .push(json!({"eventId":null,"error":error})),
             }
         }
+        let wait = queue_poll_delay(runtime.hub.persistence.is_some(), durable_burst);
         let message = tokio::select! {
+            biased;
             message=rx.recv()=>message,
-            _=tokio::time::sleep(Duration::from_millis(250))=>Some(QueueMessage::DurableWake),
+            _=tokio::time::sleep(wait)=>Some(QueueMessage::DurableWake),
         };
         let Some(message) = message else { break };
         let QueueMessage::Direct(event) = message else {
+            durable_burst = 0;
             continue;
         };
-        busy_count += 1;
-        let result = if busy_count > 1000 {
-            Err("trigger loop limit exceeded (1000 events without an idle queue)".into())
+        durable_burst = 0;
+        direct_busy_count += 1;
+        let result = if direct_busy_count > loop_limit {
+            Err(format!(
+                "trigger loop limit exceeded ({loop_limit} events without an idle queue)"
+            ))
         } else {
             runtime.dispatch(&event).await
         };
         if let Err(error) = result {
-            runtime
-                .hub
-                .failures
-                .lock()
-                .unwrap()
-                .push(json!({"eventId":event.id,"error":error}));
+            record_failure(&runtime.hub, Some(event.id as i64), error);
         }
         runtime.hub.completed.fetch_add(1, Ordering::SeqCst);
         if runtime.hub.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
-            busy_count = 0;
+            direct_busy_count = 0;
         }
     }
 }
@@ -1198,6 +1327,138 @@ mod tests {
                 completed: AtomicU64::new(0),
             }),
         }
+    }
+
+    fn persistent_test_runtime(
+        persistence: Persistence,
+    ) -> (Runtime, mpsc::Receiver<QueueMessage>) {
+        let (tx, rx) = mpsc::channel(8);
+        (
+            Runtime {
+                project: "demo-functions".into(),
+                workers: vec![],
+                client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                hub: Arc::new(Hub {
+                    tx,
+                    persistence: Some(persistence),
+                    pending: AtomicUsize::new(0),
+                    sequence: AtomicU64::new(0),
+                    failures: Mutex::new(vec![]),
+                    completed: AtomicU64::new(0),
+                }),
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn expired_in_flight_ack_failure_recovers_without_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "firebase-emu-outbox-ack-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persistence = Persistence::open(root.clone(), true).await.unwrap();
+        let document = Document {
+            name: "projects/demo-functions/databases/(default)/documents/items/recover".into(),
+            ..Default::default()
+        };
+        let records = document_outbox_record(None, Some(&document));
+        let persistence_for_write = persistence.clone();
+        let event_id = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let ids = persistence_for_write.insert_outbox(&transaction, &records)?;
+                transaction.commit()?;
+                Ok(ids[0])
+            })
+            .await
+            .unwrap();
+        let (runtime, rx) = persistent_test_runtime(persistence.clone());
+        TEST_ACK_FAILURES.store(TRANSITION_RETRIES, Ordering::SeqCst);
+        let queue = tokio::spawn(run_queue(runtime.clone(), rx));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.hub.failures.lock().unwrap().iter().any(|failure| {
+                    failure["eventId"].as_i64() == Some(event_id)
+                        && failure["error"] == "injected durable acknowledgement failure"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        persistence
+            .write(move |connection| {
+                connection.execute(
+                    "UPDATE event_outbox SET lease_until=unixepoch()-1 WHERE id=?1",
+                    [event_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = persistence
+                    .read(move |connection| {
+                        connection
+                            .query_row(
+                                "SELECT state,attempts FROM event_outbox WHERE id=?1",
+                                [event_id],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                            )
+                            .map_err(crate::persistence::Error::from)
+                    })
+                    .await
+                    .unwrap();
+                if state == ("delivered".into(), 2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.hub.failures.lock().unwrap().is_empty());
+        assert_eq!(runtime.status().await["pending"], 0);
+        assert_eq!(runtime.status().await["completed"], 1);
+        queue.abort();
+        TEST_ACK_FAILURES.store(0, Ordering::SeqCst);
+        drop(runtime);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_failures_are_deduplicated_and_bounded() {
+        let runtime = test_runtime();
+        for id in 0..(FAILURE_HISTORY_LIMIT + 50) {
+            record_failure(&runtime.hub, Some(id as i64), format!("failure {id}"));
+        }
+        assert_eq!(
+            runtime.hub.failures.lock().unwrap().len(),
+            FAILURE_HISTORY_LIMIT
+        );
+        record_failure(
+            &runtime.hub,
+            Some((FAILURE_HISTORY_LIMIT + 49) as i64),
+            format!("failure {}", FAILURE_HISTORY_LIMIT + 49),
+        );
+        assert_eq!(
+            runtime.hub.failures.lock().unwrap().len(),
+            FAILURE_HISTORY_LIMIT
+        );
+    }
+
+    #[test]
+    fn in_memory_queue_keeps_its_bounded_idle_poll() {
+        assert_eq!(
+            queue_poll_delay(false, DURABLE_BURST_LIMIT),
+            Duration::from_millis(250)
+        );
+        assert_eq!(queue_poll_delay(true, DURABLE_BURST_LIMIT), Duration::ZERO);
     }
 
     #[tokio::test]

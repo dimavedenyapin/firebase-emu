@@ -49,6 +49,7 @@ async function stop(child, crash = false) {
     FIREBASE_DATABASE_EMU_PORT: String(databasePort),
     PUBSUB_EMULATOR_PORT: String(pubsubPort),
     FIXTURE_EVENT_LOG: eventLog,
+    FIREBASE_EMU_TEST_TRIGGER_LOOP_LIMIT: '40',
   };
   let stderr = '';
   let child;
@@ -93,7 +94,25 @@ async function stop(child, crash = false) {
     await start(0);
     await new Promise(resolve => setTimeout(resolve, 750));
     assert.equal(records().filter(record => record.name === 'write').length, 2, 'durable ACK must prevent a third delivery');
-    console.log(JSON.stringify({status: 'passed', deliveries: 2, stableEventId: eventId, guarantee: 'at-least-once duplicate at delivery/ack crash boundary'}));
+    process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${firestorePort}`;
+    const loopApp = admin.initializeApp({projectId: 'demo-functions-cli'}, `loop-${Date.now()}`);
+    await loopApp.firestore().doc('loop/bounded').set({n: 0});
+    await waitFor(() => records().some(record => record.name === 'selfLoop'), 'self-trigger first delivery');
+    const direct = await fetch(`http://127.0.0.1:${functionsPort}/__/functions/pubsub/fixture-topic`, {
+      method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({data: {fair: true}}),
+    });
+    assert.equal(direct.status, 202);
+    await waitFor(() => records().some(record => record.name === 'topic' && record.value.json?.fair === true), 'direct event fairness');
+    await waitFor(async () => {
+      const response = await fetch(`http://127.0.0.1:${functionsPort}/__/functions/status`);
+      const value = await response.json();
+      return value.pending === 0 && value.failures.some(failure => /trigger loop limit exceeded/.test(failure.error));
+    }, 'bounded self-trigger failure');
+    const loopDeliveries = records().filter(record => record.name === 'selfLoop');
+    assert.equal(loopDeliveries.length, 40);
+    assert.equal(new Set(loopDeliveries.map(record => record.value.eventId)).size, 40);
+    await loopApp.delete();
+    console.log(JSON.stringify({status: 'passed', deliveries: 2, stableEventId: eventId, selfTriggerDeliveries: loopDeliveries.length, directWorkNotStarved: true, guarantee: 'at-least-once duplicate at delivery/ack crash boundary'}));
   } finally {
     await stop(child).catch(() => {});
     fs.rmSync(temporary, {recursive: true, force: true});
