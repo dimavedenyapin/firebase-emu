@@ -1,8 +1,6 @@
 name: Release binaries
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -22,7 +20,7 @@ on:
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -30,7 +28,7 @@ permissions:
 env:
   NODE_VERSION: "22"
   PYTHON_VERSION: "3.13"
-  RELEASE_REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+  RELEASE_REF: ${{ inputs.ref || github.sha }}
 
 jobs:
   metadata:

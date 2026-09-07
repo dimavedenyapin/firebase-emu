@@ -202,11 +202,11 @@ and crash recovery, browser restart persistence, and durable Functions outbox
 redelivery at the delivery/ack crash boundary. A failure in any suite fails that
 single validation job; emulator logs are printed when the SDK gate fails.
 
-The separate `Release binaries` PR workflow retains native build and packaged
-smoke coverage for Linux x64/arm64, macOS x64/arm64, and Windows x64. PR runs
-have read-only repository permissions and never publish. Release publication is
-only requested by the serialized default-branch automatic-release workflow
-after its required validation job succeeds.
+The separate reusable `Release binaries` workflow retains native build and
+packaged smoke coverage for Linux x64/arm64, macOS x64/arm64, and Windows x64.
+It does not run for pull requests. It runs only when manually dispatched or
+called by the serialized default-branch automatic-release workflow, which
+requests publication only after its required validation job succeeds.
 
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` selects an explicit Chromium executable;
 otherwise browser tests use Playwright's managed Chromium. The full Functions
