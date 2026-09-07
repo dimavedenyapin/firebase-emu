@@ -122,9 +122,11 @@ IDs are retried up to five times with bounded backoff, and terminal failures are
 reported by Functions status/drain. Failed durable state transitions are
 retried immediately, and an expired five-second delivery lease is reclaimable
 without restarting the process. Direct Pub/Sub/schedule work is checked after
-at most 32 durable deliveries. A self-triggering chain is stopped and surfaced
-as failed after 1,000 uninterrupted durable events. Delivery is at least once:
-a crash after a
+at most 32 durable deliveries. A matching same-resource chain that repeatedly
+creates the next event while it is the queue tail is treated as self-triggering
+and stopped after 1,000 events. Pre-existing or independently accumulated
+backlogs are never failed merely for exceeding that count. Delivery is at least
+once: a crash after a
 handler succeeds but before its durable acknowledgement can deliver the same
 event ID again, and one source event targeting several handlers can repeat the
 whole matching group. Exactly-once delivery is not promised. Starting with

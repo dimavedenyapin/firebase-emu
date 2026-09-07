@@ -45,6 +45,8 @@ const TRANSITION_RETRIES: usize = 5;
 const OUTBOX_LEASE_SECONDS: i64 = 5;
 #[cfg(test)]
 static TEST_ACK_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_OUTBOX_QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Hub {
     tx: mpsc::Sender<QueueMessage>,
     persistence: Option<Persistence>,
@@ -534,6 +536,7 @@ struct DurableRow {
     source: String,
     payload: Vec<u8>,
     attempts: i64,
+    has_queued_successor: bool,
 }
 
 fn decode_durable(row: &DurableRow) -> Result<QueuedEvent, String> {
@@ -580,6 +583,26 @@ fn decode_durable(row: &DurableRow) -> Result<QueuedEvent, String> {
     })
 }
 
+fn durable_chain_key(event: &QueuedEvent) -> String {
+    match &event.source {
+        EventSource::Firestore { before, after } => format!(
+            "firestore:{}",
+            after
+                .as_ref()
+                .or(before.as_ref())
+                .map(|document| document.name.as_str())
+                .unwrap_or_default()
+        ),
+        EventSource::Storage { kind, object } => format!(
+            "storage:{kind}:{}:{}",
+            object["bucket"].as_str().unwrap_or_default(),
+            object["name"].as_str().unwrap_or_default()
+        ),
+        EventSource::PubSub { topic, .. } => format!("pubsub:{topic}"),
+        EventSource::Schedule { function } => format!("schedule:{function}"),
+    }
+}
+
 async fn recover_outbox(persistence: &Persistence) -> Result<(), String> {
     persistence
         .write(|connection| {
@@ -601,10 +624,15 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
             let now = unix_now_i64();
             let row = {
                 let mut statement = transaction.prepare(
-                    "SELECT id, source, payload, attempts FROM event_outbox \
-                     WHERE (state='pending' AND available_at <= ?1) \
-                        OR (state='in_flight' AND lease_until IS NOT NULL AND lease_until <= ?1) \
-                     ORDER BY id LIMIT 1",
+                    "SELECT candidate.id, candidate.source, candidate.payload, candidate.attempts, \
+                            EXISTS(SELECT 1 FROM event_outbox AS successor \
+                                   WHERE successor.id > candidate.id \
+                                     AND successor.state IN ('pending','in_flight')) \
+                     FROM event_outbox AS candidate \
+                     WHERE (candidate.state='pending' AND candidate.available_at <= ?1) \
+                        OR (candidate.state='in_flight' AND candidate.lease_until IS NOT NULL \
+                            AND candidate.lease_until <= ?1) \
+                     ORDER BY candidate.id LIMIT 1",
                 )?;
                 statement
                     .query_row([now], |row| {
@@ -613,6 +641,7 @@ async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, S
                             source: row.get(1)?,
                             payload: row.get(2)?,
                             attempts: row.get(3)?,
+                            has_queued_successor: row.get(4)?,
                         })
                     })
                     .optional()?
@@ -773,7 +802,8 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
             record_failure(&runtime.hub, None, error);
         }
     }
-    let mut durable_busy_count = 0;
+    let mut durable_tail_key: Option<String> = None;
+    let mut durable_tail_count = 0;
     let mut direct_busy_count = 0;
     let mut durable_burst = 0;
     let loop_limit = trigger_loop_limit();
@@ -783,22 +813,31 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
                 match claim_outbox(persistence).await {
                     Ok(Some(row)) => {
                         clear_system_failures(&runtime.hub);
-                        durable_busy_count += 1;
                         durable_burst += 1;
-                        if durable_busy_count > loop_limit {
+                        let decoded = decode_durable(&row);
+                        let chain_key = decoded.as_ref().ok().map(durable_chain_key);
+                        let next_tail_count = if row.has_queued_successor {
+                            0
+                        } else if chain_key.is_some() && chain_key == durable_tail_key {
+                            durable_tail_count + 1
+                        } else {
+                            1
+                        };
+                        if next_tail_count > loop_limit {
                             let error = format!(
-                            "trigger loop limit exceeded ({loop_limit} events without an idle queue)"
-                        );
+                                "self-trigger chain limit exceeded ({loop_limit} matching tail events)"
+                            );
                             if let Err(persistence_error) =
                                 terminal_fail_outbox(persistence, row.id, error).await
                             {
                                 record_failure(&runtime.hub, Some(row.id), persistence_error);
                             }
-                            durable_busy_count = 0;
+                            durable_tail_key = None;
+                            durable_tail_count = 0;
                             durable_burst = 0;
                             continue;
                         }
-                        let result = match decode_durable(&row) {
+                        let result = match decoded {
                             Ok(event) => runtime.dispatch(&event).await,
                             Err(error) => Err(error),
                         };
@@ -822,11 +861,19 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
                                 Err(error) => record_failure(&runtime.hub, Some(row.id), error),
                             }
                         }
+                        if row.has_queued_successor {
+                            durable_tail_key = None;
+                            durable_tail_count = 0;
+                        } else {
+                            durable_tail_key = chain_key;
+                            durable_tail_count = next_tail_count;
+                        }
                         continue;
                     }
                     Ok(None) => {
                         clear_system_failures(&runtime.hub);
-                        durable_busy_count = 0;
+                        durable_tail_key = None;
+                        durable_tail_count = 0;
                         durable_burst = 0;
                     }
                     Err(error) => {
@@ -1353,6 +1400,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn expired_in_flight_ack_failure_recovers_without_restart() {
+        let _test_guard = TEST_OUTBOX_QUEUE_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!(
             "firebase-emu-outbox-ack-recovery-{}",
             uuid::Uuid::new_v4()
@@ -1426,6 +1474,77 @@ mod tests {
         assert_eq!(runtime.status().await["completed"], 1);
         queue.abort();
         TEST_ACK_FAILURES.store(0, Ordering::SeqCst);
+        drop(runtime);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_backlog_above_loop_limit_is_fully_delivered() {
+        let _test_guard = TEST_OUTBOX_QUEUE_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!(
+            "firebase-emu-outbox-independent-backlog-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persistence = Persistence::open(root.clone(), true).await.unwrap();
+        let backlog = TRIGGER_LOOP_LIMIT + 5;
+        // Use the same resource key for every row: the pre-existing successor
+        // rows, not path diversity, prove this is an ordinary backlog rather
+        // than a handler creating the next tail event.
+        let records: Vec<OutboxRecord> = (0..backlog)
+            .flat_map(|_| {
+                let document = Document {
+                    name: "projects/demo-functions/databases/(default)/documents/backlog/shared"
+                        .into(),
+                    ..Default::default()
+                };
+                document_outbox_record(None, Some(&document))
+            })
+            .collect();
+        let persistence_for_write = persistence.clone();
+        persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let ids = persistence_for_write.insert_outbox(&transaction, &records)?;
+                assert_eq!(ids.len(), backlog);
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let (runtime, rx) = persistent_test_runtime(persistence.clone());
+        let queue = tokio::spawn(run_queue(runtime.clone(), rx));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = runtime.status().await;
+                if status["pending"] == 0 && status["completed"] == backlog as u64 {
+                    assert_eq!(status["failures"], json!([]));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let states = persistence
+            .read(|connection| {
+                let active: i64 = connection.query_row(
+                    "SELECT count(*) FROM event_outbox WHERE state IN ('pending','in_flight')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let failed: i64 = connection.query_row(
+                    "SELECT count(*) FROM event_outbox WHERE state='failed'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((active, failed))
+            })
+            .await
+            .unwrap();
+        assert_eq!(states, (0, 0));
+        queue.abort();
         drop(runtime);
         drop(persistence);
         std::fs::remove_dir_all(root).unwrap();

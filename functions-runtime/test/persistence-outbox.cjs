@@ -106,7 +106,7 @@ async function stop(child, crash = false) {
     await waitFor(async () => {
       const response = await fetch(`http://127.0.0.1:${functionsPort}/__/functions/status`);
       const value = await response.json();
-      return value.pending === 0 && value.failures.some(failure => /trigger loop limit exceeded/.test(failure.error));
+      return value.pending === 0 && value.failures.some(failure => /self-trigger chain limit exceeded/.test(failure.error));
     }, 'bounded self-trigger failure');
     const loopDeliveries = records().filter(record => record.name === 'selfLoop');
     assert.equal(loopDeliveries.length, 40);
