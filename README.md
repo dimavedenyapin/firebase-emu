@@ -192,6 +192,22 @@ npm test --prefix examples/node-app
 npm test --prefix examples/web-app
 ```
 
+Every pull request is validated when it is opened, updated, reopened, or marked
+ready for review. The `Rust and Functions checks` job checks out the exact PR
+head, cancels superseded runs for the same PR, and has a 30-minute timeout. It
+runs the locked Rust formatting/check/clippy gates and all Rust targets, then
+builds the release binary and exercises real Node/Admin and browser Firebase
+SDK traffic, the relocated full Functions runtime, SQLite WAL process restart
+and crash recovery, browser restart persistence, and durable Functions outbox
+redelivery at the delivery/ack crash boundary. A failure in any suite fails that
+single validation job; emulator logs are printed when the SDK gate fails.
+
+The separate `Release binaries` PR workflow retains native build and packaged
+smoke coverage for Linux x64/arm64, macOS x64/arm64, and Windows x64. PR runs
+have read-only repository permissions and never publish. Release publication is
+only requested by the serialized default-branch automatic-release workflow
+after its required validation job succeeds.
+
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE` selects an explicit Chromium executable;
 otherwise browser tests use Playwright's managed Chromium. The full Functions
 test relocates the release binary, adapter, dependencies, and fixtures before

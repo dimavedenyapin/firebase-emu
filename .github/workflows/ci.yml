@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_call:
     inputs:
       ref:
@@ -10,7 +11,7 @@ on:
         type: string
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -20,10 +21,16 @@ jobs:
   quality:
     name: Rust and Functions checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VALIDATION_REF: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ env.VALIDATION_REF }}
+      - name: Verify exact validation commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$VALIDATION_REF"
       - name: Install Rust toolchain
         shell: bash
         run: |
@@ -69,10 +76,53 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Build release binary for restart tests
         run: cargo build --locked --release
+      - name: Install Chromium for SDK and restart tests
+        run: npx --prefix examples/web-app playwright install --with-deps chromium
+      - name: Test real Node and browser SDK traffic
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          log="$RUNNER_TEMP/firebase-emu-sdk.log"
+          ./target/release/firebase-emu --no-functions >"$log" 2>&1 &
+          emulator_pid=$!
+          cleanup() {
+            status=$?
+            kill "$emulator_pid" 2>/dev/null || true
+            wait "$emulator_pid" 2>/dev/null || true
+            if [[ "$status" -ne 0 ]]; then
+              echo "::group::firebase-emu SDK log"
+              cat "$log"
+              echo "::endgroup::"
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          python - "$emulator_pid" <<'PY'
+          import os
+          import socket
+          import sys
+          import time
+
+          pid = int(sys.argv[1])
+          deadline = time.monotonic() + 20
+          ports = (8080, 9099, 9199)
+          while time.monotonic() < deadline:
+              try:
+                  os.kill(pid, 0)
+                  for port in ports:
+                      with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                          pass
+                  break
+              except (OSError, ConnectionError):
+                  time.sleep(0.05)
+          else:
+              raise SystemExit("firebase-emu did not open SDK ports within 20 seconds")
+          PY
+          ./scripts/sdk-compat.sh --target rust
+      - name: Test full Functions runtime against the release binary
+        run: npm run test:full --prefix functions-runtime
       - name: Test durable Node/Admin process restarts
         run: npm run test:persistence --prefix examples/node-app
-      - name: Install Chromium for durable browser restart test
-        run: npx --prefix examples/web-app playwright install --with-deps chromium
       - name: Test durable Firebase browser process restart
         run: npm run test:persistence --prefix examples/web-app
       - name: Test durable Functions outbox crash recovery
