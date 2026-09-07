@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::persistence::{Error as PersistenceError, Persistence};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rusqlite::OptionalExtension;
 
 fn environment_namespace() -> String {
     project_namespace(
@@ -51,22 +53,24 @@ struct AuthState {
     users: Arc<RwLock<UserTable>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     default_namespace: String,
+    persistence: Option<Persistence>,
 }
 
 impl Default for AuthState {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
 impl AuthState {
-    fn new(project_id: Option<&str>) -> Self {
+    fn new(project_id: Option<&str>, persistence: Option<Persistence>) -> Self {
         Self {
             users: Default::default(),
             sessions: Default::default(),
             default_namespace: project_id
                 .map(project_namespace)
                 .unwrap_or_else(environment_namespace),
+            persistence,
         }
     }
 }
@@ -77,13 +81,13 @@ impl AuthState {
 /// Unscoped routes are also accepted for direct Identity Toolkit clients.
 #[cfg(test)]
 pub fn router() -> Router {
-    router_for_project(None)
+    router_for_project(None, None)
 }
 
 /// Builds the Auth router with an explicit project for browser Identity Toolkit
 /// routes. Admin SDK project-scoped routes continue to use the project in the URL.
-pub fn router_for_project(project_id: Option<&str>) -> Router {
-    let state = AuthState::new(project_id);
+pub fn router_for_project(project_id: Option<&str>, persistence: Option<Persistence>) -> Router {
+    let state = AuthState::new(project_id, persistence);
 
     Router::new()
         .route(
@@ -147,7 +151,7 @@ pub fn router_for_project(project_id: Option<&str>) -> Router {
         .with_state(state)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct User {
     local_id: String,
@@ -166,7 +170,7 @@ struct User {
     #[serde(skip_serializing_if = "Option::is_none")]
     custom_attributes: Option<String>,
     provider_user_info: Vec<Value>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     mfa_info: Vec<Value>,
     valid_since: String,
     created_at: String,
@@ -249,14 +253,22 @@ struct ListQuery {
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
-    message: &'static str,
+    message: String,
 }
 
 impl ApiError {
-    fn bad_request(message: &'static str) -> Self {
+    fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            message,
+            message: message.into(),
+        }
+    }
+
+    fn persistence(error: PersistenceError) -> Self {
+        eprintln!("Auth persistence operation failed: {error}");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("AUTH_PERSISTENCE_ERROR: {error}"),
         }
     }
 }
@@ -380,34 +392,160 @@ fn project_namespace(project_id: &str) -> String {
     format!("project/{project_id}")
 }
 
+fn encode_user(user: &User) -> Result<String, PersistenceError> {
+    serde_json::to_string(user).map_err(|error| {
+        PersistenceError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })
+}
+
+fn decode_user(json: String, password: Option<String>) -> Result<User, PersistenceError> {
+    let mut user: User = serde_json::from_str(&json).map_err(|error| {
+        PersistenceError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        ))
+    })?;
+    user.password = password;
+    Ok(user)
+}
+
+fn read_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, Option<String>)> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn load_user(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    uid: &str,
+) -> Result<Option<User>, PersistenceError> {
+    let row = connection
+        .query_row(
+            "SELECT user_json, password FROM auth_users WHERE namespace=?1 AND uid=?2",
+            rusqlite::params![namespace, uid],
+            read_user_row,
+        )
+        .optional()?;
+    row.map(|(json, password)| decode_user(json, password))
+        .transpose()
+}
+
+fn store_user(
+    transaction: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    user: &User,
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "INSERT INTO auth_users(namespace,uid,user_json,password) VALUES (?1,?2,?3,?4) \
+         ON CONFLICT(namespace,uid) DO UPDATE SET user_json=excluded.user_json,password=excluded.password",
+        rusqlite::params![namespace, user.local_id, encode_user(user)?, user.password],
+    )?;
+    Ok(())
+}
+
+fn ensure_unique_persistent(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    email: Option<&str>,
+    phone: Option<&str>,
+    except_uid: Option<&str>,
+) -> Result<Option<&'static str>, PersistenceError> {
+    let mut statement = connection
+        .prepare("SELECT uid,user_json,password FROM auth_users WHERE namespace=?1")
+        .map_err(PersistenceError::from)?;
+    let mut rows = statement
+        .query(rusqlite::params![namespace])
+        .map_err(PersistenceError::from)?;
+    while let Some(row) = rows.next().map_err(PersistenceError::from)? {
+        let uid: String = row.get(0).map_err(PersistenceError::from)?;
+        if except_uid == Some(uid.as_str()) {
+            continue;
+        }
+        let user = decode_user(
+            row.get(1).map_err(PersistenceError::from)?,
+            row.get(2).map_err(PersistenceError::from)?,
+        )?;
+        if email.is_some_and(|candidate| {
+            user.email
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(candidate))
+        }) {
+            return Ok(Some("EMAIL_EXISTS"));
+        }
+        if phone.is_some_and(|candidate| user.phone_number.as_deref() == Some(candidate)) {
+            return Ok(Some("PHONE_NUMBER_EXISTS"));
+        }
+    }
+    Ok(None)
+}
+
 async fn create_account(
     state: AuthState,
     namespace: String,
     request: WriteAccountRequest,
 ) -> ApiResult {
     validate_credentials(&request)?;
-    let mut tables = state.users.write().await;
-    let users = tables.entry(namespace.clone()).or_default();
     let local_id = request
         .local_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
 
     if local_id.is_empty() {
         return Err(ApiError::bad_request("INVALID_LOCAL_ID"));
     }
+    let user = new_user(local_id.clone(), request);
+    if let Some(persistence) = &state.persistence {
+        let persistence = persistence.clone();
+        let namespace = namespace.clone();
+        let durable_user = user.clone();
+        let outcome = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                if load_user(&transaction, &namespace, &durable_user.local_id)?.is_some() {
+                    return Ok(Some("DUPLICATE_LOCAL_ID"));
+                }
+                if let Some(error) = ensure_unique_persistent(
+                    &transaction,
+                    &namespace,
+                    durable_user.email.as_deref(),
+                    durable_user.phone_number.as_deref(),
+                    None,
+                )? {
+                    return Ok(Some(error));
+                }
+                store_user(&transaction, &namespace, &durable_user)?;
+                transaction.commit()?;
+                Ok(None)
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        if let Some(error) = outcome {
+            return Err(ApiError::bad_request(error));
+        }
+        return Ok(Json(serde_json::to_value(user).unwrap()));
+    }
+
+    let mut tables = state.users.write().await;
+    let users = tables.entry(namespace).or_default();
     if users.contains_key(&local_id) {
         return Err(ApiError::bad_request("DUPLICATE_LOCAL_ID"));
     }
     ensure_unique(
         users,
-        request.email.as_deref(),
-        request.phone_number.as_deref(),
+        user.email.as_deref(),
+        user.phone_number.as_deref(),
         None,
     )?;
+    users.insert(local_id, user.clone());
+    Ok(Json(
+        serde_json::to_value(user).expect("User serialization cannot fail"),
+    ))
+}
 
+fn new_user(local_id: String, request: WriteAccountRequest) -> User {
     let now = now_millis();
-    let user = User {
-        local_id: local_id.clone(),
+    let mut user = User {
+        local_id,
         password: request.password,
         email: request.email,
         email_verified: request.email_verified.unwrap_or(false),
@@ -430,13 +568,8 @@ async fn create_account(
         created_at: now.clone(),
         last_login_at: now,
     };
-
-    let mut user = user;
     sync_password_provider(&mut user);
-    users.insert(local_id, user.clone());
-    Ok(Json(
-        serde_json::to_value(user).expect("User serialization cannot fail"),
-    ))
+    user
 }
 
 async fn lookup_accounts(
@@ -446,6 +579,52 @@ async fn lookup_accounts(
 ) -> ApiResult {
     if let Some(token) = request.id_token.take() {
         request.local_id = vec![session_user(&state, &namespace, &token).await?.local_id];
+    }
+    if let Some(persistence) = &state.persistence {
+        let namespace = namespace.clone();
+        let ids: HashSet<String> = request.local_id.into_iter().collect();
+        let emails: HashSet<String> = request
+            .email
+            .into_iter()
+            .map(|email| email.to_lowercase())
+            .collect();
+        let phones: HashSet<String> = request.phone_number.into_iter().collect();
+        let federated = request.federated_user_id;
+        let found = persistence
+            .read(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT user_json,password FROM auth_users WHERE namespace=?1 ORDER BY uid",
+                )?;
+                let mut rows = statement.query(rusqlite::params![namespace])?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let user = decode_user(row.get(0)?, row.get(1)?)?;
+                    let matches = ids.contains(&user.local_id)
+                        || user
+                            .email
+                            .as_ref()
+                            .is_some_and(|v| emails.contains(&v.to_lowercase()))
+                        || user
+                            .phone_number
+                            .as_ref()
+                            .is_some_and(|v| phones.contains(v))
+                        || federated.iter().any(|wanted| {
+                            user.provider_user_info.iter().any(|provider| {
+                                provider.get("providerId").and_then(Value::as_str)
+                                    == Some(wanted.provider_id.as_str())
+                                    && provider.get("rawId").and_then(Value::as_str)
+                                        == Some(wanted.raw_id.as_str())
+                            })
+                        });
+                    if matches {
+                        found.push(user);
+                    }
+                }
+                Ok(found)
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        return Ok(Json(json!({"users": found})));
     }
     let tables = state.users.read().await;
     let Some(users) = tables.get(&namespace) else {
@@ -495,6 +674,51 @@ async fn update_account(
         .local_id
         .take()
         .ok_or_else(|| ApiError::bad_request("MISSING_LOCAL_ID"))?;
+    if let Some(persistence) = &state.persistence {
+        let namespace = namespace.clone();
+        let local_id = local_id.clone();
+        let outcome = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let Some(mut user) = load_user(&transaction, &namespace, &local_id)? else {
+                    return Ok((Some("USER_NOT_FOUND"), None, None));
+                };
+                if let Some(error) = ensure_unique_persistent(
+                    &transaction,
+                    &namespace,
+                    request.email.as_deref(),
+                    request.phone_number.as_deref(),
+                    Some(&local_id),
+                )? {
+                    return Ok((Some(error), None, None));
+                }
+                apply_update(&mut user, request);
+                let session = if browser {
+                    let (value, sessions) = session_bundle(&namespace, &user);
+                    insert_sessions(&transaction, &sessions)?;
+                    Some(value)
+                } else {
+                    None
+                };
+                store_user(&transaction, &namespace, &user)?;
+                transaction.commit()?;
+                Ok((None, Some(user), session))
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        if let Some(error) = outcome.0 {
+            return Err(ApiError::bad_request(error));
+        }
+        let user = outcome.1.expect("successful update returns user");
+        let mut value = serde_json::to_value(&user).unwrap();
+        if let Some(session) = outcome.2 {
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(session.as_object().unwrap().clone());
+        }
+        return Ok(Json(value));
+    }
     let mut tables = state.users.write().await;
     let users = tables.entry(namespace.clone()).or_default();
     if !users.contains_key(&local_id) {
@@ -510,8 +734,22 @@ async fn update_account(
     let user = users
         .get_mut(&local_id)
         .expect("user existence checked above");
-    apply_deletions(user, &request.delete_attribute, &request.delete_provider);
+    apply_update(user, request);
+    let user = user.clone();
+    drop(tables);
+    let mut value = serde_json::to_value(&user).unwrap();
+    if browser {
+        let session = issue_session(&state, &namespace, &user).await;
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(session.as_object().unwrap().clone());
+    }
+    Ok(Json(value))
+}
 
+fn apply_update(user: &mut User, request: WriteAccountRequest) {
+    apply_deletions(user, &request.delete_attribute, &request.delete_provider);
     if request.password.is_some() {
         user.password = request.password;
     }
@@ -550,19 +788,7 @@ async fn update_account(
     } else if !request.mfa_info.is_empty() {
         user.mfa_info = request.mfa_info;
     }
-
     sync_password_provider(user);
-    let user = user.clone();
-    drop(tables);
-    let mut value = serde_json::to_value(&user).unwrap();
-    if browser {
-        let session = issue_session(&state, &namespace, &user).await;
-        value
-            .as_object_mut()
-            .unwrap()
-            .extend(session.as_object().unwrap().clone());
-    }
-    Ok(Json(value))
 }
 
 async fn delete_account(
@@ -572,6 +798,33 @@ async fn delete_account(
 ) -> ApiResult {
     if let Some(token) = request.id_token.take() {
         request.local_id = session_user(&state, &namespace, &token).await?.local_id;
+    }
+    if let Some(persistence) = &state.persistence {
+        let namespace = namespace.clone();
+        let uid = request.local_id.clone();
+        let deleted = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let deleted = transaction.execute(
+                    "DELETE FROM auth_users WHERE namespace=?1 AND uid=?2",
+                    rusqlite::params![namespace, uid],
+                )?;
+                if deleted != 0 {
+                    transaction.execute(
+                        "DELETE FROM auth_sessions WHERE namespace=?1 AND uid=?2",
+                        rusqlite::params![namespace, uid],
+                    )?;
+                    transaction.commit()?;
+                }
+                Ok(deleted != 0)
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        return if deleted {
+            Ok(Json(json!({})))
+        } else {
+            Err(ApiError::bad_request("USER_NOT_FOUND"))
+        };
     }
     let mut tables = state.users.write().await;
     let deleted = tables
@@ -592,26 +845,50 @@ async fn delete_account(
 
 async fn query_accounts(state: AuthState, namespace: String, request: ListRequest) -> ApiResult {
     let limit = request.max_results.or(request.page_size).unwrap_or(1000);
-    let users = list_users(&state, &namespace, limit).await;
+    let users = list_users(&state, &namespace, limit).await?;
     // projects.accounts.query calls the field userInfo. Including users as an
     // alias also makes this useful to small direct clients.
     Ok(Json(json!({"userInfo": users, "users": users})))
 }
 
 async fn batch_get_accounts(state: AuthState, namespace: String, request: ListQuery) -> ApiResult {
-    let users = list_users(&state, &namespace, request.max_results.unwrap_or(1000)).await;
+    let users = list_users(&state, &namespace, request.max_results.unwrap_or(1000)).await?;
     Ok(Json(json!({"users": users})))
 }
 
-async fn list_users(state: &AuthState, namespace: &str, limit: usize) -> Vec<User> {
+async fn list_users(
+    state: &AuthState,
+    namespace: &str,
+    limit: usize,
+) -> Result<Vec<User>, ApiError> {
+    if let Some(persistence) = &state.persistence {
+        let namespace = namespace.to_owned();
+        return persistence
+            .read(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT user_json,password FROM auth_users WHERE namespace=?1 ORDER BY uid LIMIT ?2",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![namespace, limit.min(1000) as i64],
+                    read_user_row,
+                )?;
+                rows.map(|row| {
+                    let (json, password) = row?;
+                    decode_user(json, password)
+                })
+                .collect()
+            })
+            .await
+            .map_err(ApiError::persistence);
+    }
     let tables = state.users.read().await;
-    tables
+    Ok(tables
         .get(namespace)
         .into_iter()
         .flat_map(|users| users.values())
         .take(limit.min(1000))
         .cloned()
-        .collect()
+        .collect())
 }
 
 fn ensure_unique(
@@ -816,7 +1093,9 @@ mod tests {
         .await
         .unwrap();
 
-        let users = list_users(&state, &project_namespace("project-a"), 100).await;
+        let users = list_users(&state, &project_namespace("project-a"), 100)
+            .await
+            .unwrap();
         assert_eq!(users.len(), 1);
     }
 
@@ -865,6 +1144,45 @@ async fn sign_up(
         return Err(ApiError::bad_request("MISSING_PASSWORD"));
     }
     let namespace = state.default_namespace.clone();
+    if let Some(persistence) = &state.persistence {
+        validate_credentials(&request)?;
+        let local_id = request
+            .local_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        if local_id.is_empty() {
+            return Err(ApiError::bad_request("INVALID_LOCAL_ID"));
+        }
+        let user = new_user(local_id, request);
+        let namespace_for_write = namespace.clone();
+        let (session, sessions) = session_bundle(&namespace, &user);
+        let outcome = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                if load_user(&transaction, &namespace_for_write, &user.local_id)?.is_some() {
+                    return Ok(Some("DUPLICATE_LOCAL_ID"));
+                }
+                if let Some(error) = ensure_unique_persistent(
+                    &transaction,
+                    &namespace_for_write,
+                    user.email.as_deref(),
+                    user.phone_number.as_deref(),
+                    None,
+                )? {
+                    return Ok(Some(error));
+                }
+                store_user(&transaction, &namespace_for_write, &user)?;
+                insert_sessions(&transaction, &sessions)?;
+                transaction.commit()?;
+                Ok(None)
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        if let Some(error) = outcome {
+            return Err(ApiError::bad_request(error));
+        }
+        return Ok(Json(session));
+    }
     let created = create_account(state.clone(), namespace.clone(), request)
         .await?
         .0;
@@ -883,6 +1201,42 @@ async fn sign_in(
     let password = request
         .password
         .ok_or_else(|| ApiError::bad_request("MISSING_PASSWORD"))?;
+    if let Some(persistence) = &state.persistence {
+        let namespace_for_write = namespace.clone();
+        let result = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let mut statement = transaction.prepare(
+                    "SELECT user_json,password FROM auth_users WHERE namespace=?1 AND lower(json_extract(user_json,'$.email'))=lower(?2) LIMIT 1",
+                )?;
+                let row = statement
+                    .query_row(rusqlite::params![namespace_for_write, email], read_user_row)
+                    .optional()?;
+                drop(statement);
+                let Some((json, credential)) = row else {
+                    return Ok((Some("EMAIL_NOT_FOUND"), None));
+                };
+                let mut user = decode_user(json, credential)?;
+                if user.disabled {
+                    return Ok((Some("USER_DISABLED"), None));
+                }
+                if user.password.as_deref() != Some(password.as_str()) {
+                    return Ok((Some("INVALID_PASSWORD"), None));
+                }
+                user.last_login_at = now_millis();
+                let (value, sessions) = session_bundle(&namespace_for_write, &user);
+                store_user(&transaction, &namespace_for_write, &user)?;
+                insert_sessions(&transaction, &sessions)?;
+                transaction.commit()?;
+                Ok((None, Some(value)))
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        if let Some(error) = result.0 {
+            return Err(ApiError::bad_request(error));
+        }
+        return Ok(Json(result.1.expect("successful sign-in has session")));
+    }
     let mut tables = state.users.write().await;
     let user = tables
         .entry(namespace.clone())
@@ -907,10 +1261,24 @@ async fn sign_in(
 }
 
 async fn issue_session(state: &AuthState, namespace: &str, user: &User) -> Value {
-    let now = SystemTime::now()
+    debug_assert!(state.persistence.is_none());
+    let (value, sessions) = session_bundle(namespace, user);
+    let now = unix_seconds();
+    let mut current = state.sessions.write().await;
+    current.retain(|_, session| session.expires_at > now);
+    current.extend(sessions);
+    value
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+}
+
+fn session_bundle(namespace: &str, user: &User) -> (Value, Vec<(String, Session)>) {
+    let now = unix_seconds();
     let project = namespace.strip_prefix("project/").unwrap_or(namespace);
     let provider = if user.password.is_some() {
         "password"
@@ -944,48 +1312,139 @@ async fn issue_session(state: &AuthState, namespace: &str, user: &User) -> Value
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
     );
     let refresh = Uuid::new_v4().to_string();
-    let mut sessions = state.sessions.write().await;
-    sessions.retain(|_, session| session.expires_at > now);
-    sessions.insert(
-        token.clone(),
-        Session {
-            namespace: namespace.into(),
-            uid: user.local_id.clone(),
-            issued_at: now,
-            expires_at: now + ID_TOKEN_TTL_SECS,
-            kind: SessionKind::IdToken,
-        },
-    );
-    sessions.insert(
-        refresh.clone(),
-        Session {
-            namespace: namespace.into(),
-            uid: user.local_id.clone(),
-            issued_at: now,
-            expires_at: now + REFRESH_TOKEN_TTL_SECS,
-            kind: SessionKind::RefreshToken,
-        },
-    );
-    json!({"localId":user.local_id,"email":user.email,"displayName":user.display_name,"idToken":token,"refreshToken":refresh,"expiresIn":"3600","registered":true})
+    let sessions = vec![
+        (
+            token.clone(),
+            Session {
+                namespace: namespace.into(),
+                uid: user.local_id.clone(),
+                issued_at: now,
+                expires_at: now + ID_TOKEN_TTL_SECS,
+                kind: SessionKind::IdToken,
+            },
+        ),
+        (
+            refresh.clone(),
+            Session {
+                namespace: namespace.into(),
+                uid: user.local_id.clone(),
+                issued_at: now,
+                expires_at: now + REFRESH_TOKEN_TTL_SECS,
+                kind: SessionKind::RefreshToken,
+            },
+        ),
+    ];
+    (
+        json!({"localId":user.local_id,"email":user.email,"displayName":user.display_name,"idToken":token,"refreshToken":refresh,"expiresIn":"3600","registered":true}),
+        sessions,
+    )
+}
+
+fn insert_sessions(
+    transaction: &rusqlite::Transaction<'_>,
+    sessions: &[(String, Session)],
+) -> Result<(), PersistenceError> {
+    transaction.execute(
+        "DELETE FROM auth_sessions WHERE expires_at <= ?1",
+        rusqlite::params![unix_seconds() as i64],
+    )?;
+    for (token, session) in sessions {
+        transaction.execute(
+            "INSERT OR REPLACE INTO auth_sessions(token,namespace,uid,issued_at,expires_at,kind) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                token,
+                session.namespace,
+                session.uid,
+                session.issued_at as i64,
+                session.expires_at as i64,
+                if session.kind == SessionKind::IdToken {
+                    0
+                } else {
+                    1
+                }
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result<User, ApiError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let session = state
-        .sessions
-        .read()
-        .await
-        .get(token)
-        .cloned()
-        .ok_or_else(|| ApiError::bad_request("INVALID_ID_TOKEN"))?;
+    let now = unix_seconds();
+    let (session, user) = if let Some(persistence) = &state.persistence {
+        let namespace = namespace.to_owned();
+        let token = token.to_owned();
+        let found = persistence
+            .read(move |connection| {
+                let transaction = connection.transaction()?;
+                let session = transaction
+                    .query_row(
+                        "SELECT namespace,uid,issued_at,expires_at,kind FROM auth_sessions WHERE token=?1",
+                        rusqlite::params![token],
+                        |row| {
+                            Ok(Session {
+                                namespace: row.get(0)?,
+                                uid: row.get(1)?,
+                                issued_at: row.get::<_, i64>(2)? as u64,
+                                expires_at: row.get::<_, i64>(3)? as u64,
+                                kind: if row.get::<_, i64>(4)? == 0 { SessionKind::IdToken } else { SessionKind::RefreshToken },
+                            })
+                        },
+                    )
+                    .optional()?;
+                let user = match &session {
+                    Some(session) => load_user(&transaction, &namespace, &session.uid)?,
+                    None => None,
+                };
+                transaction.commit()?;
+                Ok((session, user))
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        let session = found
+            .0
+            .ok_or_else(|| ApiError::bad_request("INVALID_ID_TOKEN"))?;
+        let user = found
+            .1
+            .ok_or_else(|| ApiError::bad_request("USER_NOT_FOUND"))?;
+        (session, user)
+    } else {
+        let session = state
+            .sessions
+            .read()
+            .await
+            .get(token)
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("INVALID_ID_TOKEN"))?;
+        let user = state
+            .users
+            .read()
+            .await
+            .get(namespace)
+            .and_then(|users| users.get(&session.uid))
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("USER_NOT_FOUND"))?;
+        (session, user)
+    };
     if session.kind != SessionKind::IdToken || session.namespace != namespace {
         return Err(ApiError::bad_request("INVALID_ID_TOKEN"));
     }
     if session.expires_at <= now {
-        state.sessions.write().await.remove(token);
+        if let Some(persistence) = &state.persistence {
+            let token = token.to_owned();
+            persistence
+                .write(move |connection| {
+                    connection.execute(
+                        "DELETE FROM auth_sessions WHERE token=?1",
+                        rusqlite::params![token],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(ApiError::persistence)?;
+        } else {
+            state.sessions.write().await.remove(token);
+        }
         return Err(ApiError::bad_request("TOKEN_EXPIRED"));
     }
     let claims = token
@@ -997,14 +1456,6 @@ async fn session_user(state: &AuthState, namespace: &str, token: &str) -> Result
     if claims["exp"].as_u64().unwrap_or(0) <= now {
         return Err(ApiError::bad_request("TOKEN_EXPIRED"));
     }
-    let user = state
-        .users
-        .read()
-        .await
-        .get(namespace)
-        .and_then(|users| users.get(&session.uid))
-        .cloned()
-        .ok_or_else(|| ApiError::bad_request("USER_NOT_FOUND"))?;
     if user.disabled {
         return Err(ApiError::bad_request("USER_DISABLED"));
     }
@@ -1027,10 +1478,53 @@ async fn refresh_token(
     if Uuid::parse_str(refresh).is_err() {
         return Err(ApiError::bad_request("INVALID_REFRESH_TOKEN"));
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_seconds();
+    if let Some(persistence) = &state.persistence {
+        let refresh = refresh.to_owned();
+        let result = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let session = transaction
+                    .query_row(
+                        "SELECT namespace,uid,issued_at,expires_at,kind FROM auth_sessions WHERE token=?1",
+                        rusqlite::params![refresh],
+                        |row| {
+                            Ok(Session {
+                                namespace: row.get(0)?,
+                                uid: row.get(1)?,
+                                issued_at: row.get::<_, i64>(2)? as u64,
+                                expires_at: row.get::<_, i64>(3)? as u64,
+                                kind: if row.get::<_, i64>(4)? == 0 { SessionKind::IdToken } else { SessionKind::RefreshToken },
+                            })
+                        },
+                    )
+                    .optional()?;
+                let Some(session) = session else { return Ok((Some("INVALID_REFRESH_TOKEN"), None)); };
+                if session.kind != SessionKind::RefreshToken || session.expires_at <= now {
+                    transaction.execute("DELETE FROM auth_sessions WHERE token=?1", rusqlite::params![refresh])?;
+                    transaction.commit()?;
+                    return Ok((Some("INVALID_REFRESH_TOKEN"), None));
+                }
+                let Some(user) = load_user(&transaction, &session.namespace, &session.uid)? else {
+                    return Ok((Some("USER_NOT_FOUND"), None));
+                };
+                if user.disabled { return Ok((Some("USER_DISABLED"), None)); }
+                if user.valid_since.parse::<u64>().unwrap_or(0) > session.issued_at {
+                    return Ok((Some("TOKEN_EXPIRED"), None));
+                }
+                let (value, sessions) = session_bundle(&session.namespace, &user);
+                insert_sessions(&transaction, &sessions)?;
+                transaction.commit()?;
+                let response = json!({"access_token":value["idToken"],"id_token":value["idToken"],"refresh_token":value["refreshToken"],"expires_in":"3600","token_type":"Bearer","user_id":session.uid,"project_id":session.namespace.strip_prefix("project/").unwrap_or(&session.namespace)});
+                Ok((None, Some(response)))
+            })
+            .await
+            .map_err(ApiError::persistence)?;
+        if let Some(error) = result.0 {
+            return Err(ApiError::bad_request(error));
+        }
+        return Ok(Json(result.1.expect("successful refresh has response")));
+    }
     let session = state
         .sessions
         .read()
@@ -1168,7 +1662,7 @@ mod session_tests {
     #[tokio::test]
     async fn configured_project_claims_survive_signup_signin_and_refresh() {
         let project = "demo-real-app-auth";
-        let state = AuthState::new(Some(project));
+        let state = AuthState::new(Some(project), None);
         let assert_project = |session: &Value, token_key: &str| {
             let claims = token_claims(session[token_key].as_str().unwrap());
             assert_eq!(
@@ -1293,7 +1787,9 @@ mod session_tests {
         .await
         .unwrap();
         assert_eq!(
-            list_users(&state, &ns, 10).await[0].display_name.as_deref(),
+            list_users(&state, &ns, 10).await.unwrap()[0]
+                .display_name
+                .as_deref(),
             Some("Browser edit")
         );
         let _ = delete_account(
@@ -1306,7 +1802,7 @@ mod session_tests {
         )
         .await
         .unwrap();
-        assert!(list_users(&state, &ns, 10).await.is_empty());
+        assert!(list_users(&state, &ns, 10).await.unwrap().is_empty());
         assert!(state.sessions.read().await.is_empty());
     }
 
@@ -1346,5 +1842,138 @@ mod session_tests {
             "INVALID_REFRESH_TOKEN"
         );
         assert!(state.sessions.read().await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("firebase-emu-auth-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn credentials() -> WriteAccountRequest {
+        WriteAccountRequest {
+            email: Some("durable@example.test".into()),
+            password: Some("secret123".into()),
+            display_name: Some("Durable User".into()),
+            custom_attributes: Some(r#"{"role":"admin","nested":{"level":7}}"#.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn users_credentials_claims_and_sessions_survive_reopen_without_hydration() {
+        let directory = root("restart");
+        let persistence = Persistence::open(directory.clone(), false).await.unwrap();
+        let state = AuthState::new(Some("demo-durable"), Some(persistence.clone()));
+        let namespace = state.default_namespace.clone();
+        let signed_up = sign_up(State(state.clone()), Json(credentials()))
+            .await
+            .unwrap()
+            .0;
+        let id_token = signed_up["idToken"].as_str().unwrap().to_owned();
+        let refresh = signed_up["refreshToken"].as_str().unwrap().to_owned();
+        assert!(state.users.read().await.is_empty());
+        assert!(state.sessions.read().await.is_empty());
+        drop(state);
+        drop(persistence);
+
+        let persistence = Persistence::open(directory.clone(), false).await.unwrap();
+        let restarted = AuthState::new(Some("demo-durable"), Some(persistence.clone()));
+        let user = session_user(&restarted, &namespace, &id_token)
+            .await
+            .unwrap();
+        assert_eq!(user.password.as_deref(), Some("secret123"));
+        assert_eq!(
+            user.custom_attributes.as_deref(),
+            Some(r#"{"role":"admin","nested":{"level":7}}"#)
+        );
+        assert_eq!(
+            sign_in(State(restarted.clone()), Json(credentials()))
+                .await
+                .unwrap()
+                .0["displayName"],
+            "Durable User"
+        );
+        let refreshed = refresh_token(
+            State(restarted.clone()),
+            axum::Form(HashMap::from([
+                ("grant_type".into(), "refresh_token".into()),
+                ("refresh_token".into(), refresh),
+            ])),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(refreshed["project_id"], "demo-durable");
+        assert!(restarted.users.read().await.is_empty());
+        assert!(restarted.sessions.read().await.is_empty());
+        drop(restarted);
+        drop(persistence);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_delete_invalidates_sessions_and_projects_remain_isolated() {
+        let directory = root("delete-isolation");
+        let persistence = Persistence::open(directory.clone(), false).await.unwrap();
+        let state = AuthState::new(Some("project-a"), Some(persistence.clone()));
+        let namespace_a = project_namespace("project-a");
+        let namespace_b = project_namespace("project-b");
+        let first = sign_up(State(state.clone()), Json(credentials()))
+            .await
+            .unwrap()
+            .0;
+        let uid = first["localId"].as_str().unwrap().to_owned();
+        let _ = create_account(
+            state.clone(),
+            namespace_b.clone(),
+            WriteAccountRequest {
+                local_id: Some(uid.clone()),
+                email: Some("other-project@example.test".into()),
+                password: Some("secret456".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let _ = delete_account(
+            state.clone(),
+            namespace_a.clone(),
+            DeleteRequest {
+                local_id: uid,
+                id_token: None,
+            },
+        )
+        .await
+        .unwrap();
+        drop(state);
+        drop(persistence);
+
+        let persistence = Persistence::open(directory.clone(), false).await.unwrap();
+        let restarted = AuthState::new(Some("project-a"), Some(persistence.clone()));
+        assert!(list_users(&restarted, &namespace_a, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_users(&restarted, &namespace_b, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            session_user(&restarted, &namespace_a, first["idToken"].as_str().unwrap())
+                .await
+                .unwrap_err()
+                .message,
+            "INVALID_ID_TOKEN"
+        );
+        drop(restarted);
+        drop(persistence);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

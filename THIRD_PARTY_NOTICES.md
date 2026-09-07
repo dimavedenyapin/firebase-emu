@@ -14,3 +14,8 @@ it is not presented as a vendored Google source file.
 Rust and npm dependencies retain their own licenses and notices in their
 distributed packages. `Cargo.lock` and npm lockfiles record exact dependency
 versions.
+
+Release binaries link the SQLite C library through the `bundled` feature of
+`libsqlite3-sys`/`rusqlite`; SQLite is in the public domain. `rusqlite`,
+`libsqlite3-sys`, and `fs2` retain their upstream licenses recorded by
+`Cargo.lock`.

@@ -48,6 +48,25 @@ def http_status(url: str, data: bytes | None = None) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
+def http_request(
+    url: str,
+    method: str,
+    data: bytes | None = None,
+    content_type: str = "application/json",
+) -> tuple[int, bytes]:
+    request = urllib.request.Request(
+        url,
+        method=method,
+        data=data,
+        headers={"content-type": content_type},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
 def wait_http(
     url: str,
     process: subprocess.Popen[bytes],
@@ -133,6 +152,81 @@ def smoke(args: argparse.Namespace) -> None:
             status, _ = http_status(f"http://127.0.0.1:{auth}/")
             if status == 0:
                 raise RuntimeError("Auth HTTP listener returned no response")
+        finally:
+            stop(process)
+
+        data_dir = root / "persistent data with spaces"
+        persistence_args = ["--data-dir", str(data_dir), "--no-functions"]
+        process = run_binary(binary, persistence_args, environment)
+        try:
+            for port in (firestore, auth, storage):
+                wait_tcp(port, process)
+            duplicate = run_binary(binary, persistence_args, environment)
+            try:
+                duplicate.wait(timeout=10)
+                duplicate_error = b"" if duplicate.stderr is None else duplicate.stderr.read(16384)
+                if duplicate.returncode == 0 or b"already owned" not in duplicate_error:
+                    raise RuntimeError(
+                        f"duplicate data-directory owner was not rejected: {duplicate.returncode} {duplicate_error!r}"
+                    )
+            finally:
+                stop(duplicate)
+
+            firestore_document = "projects/demo-release/databases/(default)/documents/native/restart"
+            commit = json.dumps({"writes": [{"update": {
+                "name": firestore_document,
+                "fields": {"value": {"integerValue": "9223372036854775807"}},
+            }}]}).encode()
+            status, body = http_request(
+                f"http://127.0.0.1:{firestore}/v1/projects/demo-release/databases/(default)/documents:commit",
+                "POST",
+                commit,
+            )
+            if status != 200:
+                raise RuntimeError(f"persistent Firestore seed failed: {status} {body!r}")
+            status, body = http_request(
+                f"http://127.0.0.1:{auth}/identitytoolkit.googleapis.com/v1/projects/demo-release/accounts",
+                "POST",
+                json.dumps({"localId": "native-user", "email": "native@example.test"}).encode(),
+            )
+            if status != 200:
+                raise RuntimeError(f"persistent Auth seed failed: {status} {body!r}")
+            storage_bytes = b"native\x00restart\xff"
+            status, body = http_request(
+                f"http://127.0.0.1:{storage}/demo-release.appspot.com/folder%2Fobject.bin",
+                "PUT",
+                storage_bytes,
+                "application/octet-stream",
+            )
+            if status != 200:
+                raise RuntimeError(f"persistent Storage seed failed: {status} {body!r}")
+        finally:
+            stop(process)
+
+        process = run_binary(binary, persistence_args, environment)
+        try:
+            for port in (firestore, auth, storage):
+                wait_tcp(port, process)
+            status, body = http_request(
+                f"http://127.0.0.1:{firestore}/v1/projects/demo-release/databases/(default)/documents:batchGet",
+                "POST",
+                json.dumps({"documents": [firestore_document]}).encode(),
+            )
+            if status != 200 or json.loads(body)[0].get("found", {}).get("fields", {}).get("value", {}).get("integerValue") != "9223372036854775807":
+                raise RuntimeError(f"persistent Firestore restart failed: {status} {body!r}")
+            status, body = http_request(
+                f"http://127.0.0.1:{auth}/identitytoolkit.googleapis.com/v1/projects/demo-release/accounts:lookup",
+                "POST",
+                json.dumps({"localId": ["native-user"]}).encode(),
+            )
+            if status != 200 or json.loads(body).get("users", [{}])[0].get("localId") != "native-user":
+                raise RuntimeError(f"persistent Auth restart failed: {status} {body!r}")
+            status, body = http_request(
+                f"http://127.0.0.1:{storage}/demo-release.appspot.com/folder%2Fobject.bin",
+                "GET",
+            )
+            if status != 200 or body != storage_bytes:
+                raise RuntimeError(f"persistent Storage restart failed: {status} {body!r}")
         finally:
             stop(process)
 

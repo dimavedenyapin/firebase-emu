@@ -382,11 +382,11 @@ async fn target_docs(core: &FirestoreService, spec: &Json) -> Result<Vec<pb::Doc
         )
         .await
     } else {
-        let store = core.store.lock().await;
-        Ok(array(&spec["documents"], "documents")
+        let names = array(&spec["documents"], "documents")
             .iter()
-            .filter_map(|n| n.as_str().and_then(|n| store.documents.get(n)).cloned())
-            .collect())
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        core.documents(&names).await
     }
 }
 async fn refresh(

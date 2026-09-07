@@ -47,7 +47,7 @@ test('launcher downloads, verifies, caches, and forwards spaced arguments', {
     fs.rmSync(root, {recursive: true, force: true});
   });
   const output = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.resolve(__dirname, '../bin/firebase-emu.cjs'), '--config', 'a path with spaces'], {
+    const child = spawn(process.execPath, [path.resolve(__dirname, '../bin/firebase-emu.cjs'), '--config', 'a path with spaces', '--data-dir', 'durable data with spaces'], {
       env: {...process.env, FIREBASE_EMU_CACHE_DIR: cache, FIREBASE_EMU_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`},
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -57,7 +57,7 @@ test('launcher downloads, verifies, caches, and forwards spaced arguments', {
     child.on('error', reject);
     child.on('exit', code => code === 0 ? resolve(stdout) : reject(new Error(stderr)));
   });
-  assert.equal(output, '--config\na path with spaces\n');
+  assert.equal(output, '--config\na path with spaces\n--data-dir\ndurable data with spaces\n');
   assert.ok(fs.existsSync(path.join(cache, pkg.version, target, 'firebase-emu')));
   assert.ok(fs.existsSync(path.join(cache, pkg.version, target, 'functions-runtime', 'adapter.cjs')));
 });

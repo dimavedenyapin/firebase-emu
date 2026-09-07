@@ -37,6 +37,7 @@ export function createClient(env = import.meta.env) {
     listen(id, next, error) { return onSnapshot(document(id), { includeMetadataChanges: true }, snap => { if (!snap.metadata.fromCache) next(snap.exists() ? snap.data() : null); }, error); },
     upload: (name, bytes) => bounded(uploadBytes(ref(storage, name), bytes, { contentType: 'text/plain' })),
     download: async name => { const url = await bounded(getDownloadURL(ref(storage, name))); const response = await bounded(fetch(url, { signal: AbortSignal.timeout(6000) })); if (!response.ok) throw new Error(`Download HTTP ${response.status}`); return response.text(); },
+    downloadBytes: async name => { const url = await bounded(getDownloadURL(ref(storage, name))); const response = await bounded(fetch(url, { signal: AbortSignal.timeout(6000) })); if (!response.ok) throw new Error(`Download HTTP ${response.status}`); return new Uint8Array(await response.arrayBuffer()); },
     listFiles: async () => (await bounded(listAll(ref(storage)))).items.map(item => item.name),
     deleteFile: name => bounded(deleteObject(ref(storage, name)))
   };

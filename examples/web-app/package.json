@@ -7,7 +7,8 @@
     "build": "vite build",
     "test": "vitest run",
     "probe": "node scripts/probe.mjs",
-    "test:integration": "node scripts/probe.mjs --strict"
+    "test:integration": "node scripts/probe.mjs --strict",
+    "test:persistence": "node scripts/persistence-restart.mjs"
   },
   "dependencies": {
     "firebase": "12.12.1",

@@ -6,6 +6,14 @@ The service supports nested update masks, field deletion, quoted field paths, ma
 
 The strict Node SDK checks use direct `@google-cloud/firestore` 7.11.6. The strict browser checks use Firebase 12.12.1. Both must pass partial merge, where/order/limit, and a live listener update. Exact combined results are in `compat-sdk/README.md`.
 
+Persistent mode stores complete `Document` protobufs under full names in
+SQLite. Reads use bounded blocking connections and writes use one bounded
+dedicated writer queue; SQLite work does not run on Tokio executor threads.
+Committed batches and trigger outbox rows share a transaction, and listener
+invalidation happens only after commit. Queries preserve current semantics by
+decoding and filtering a transient scan rather than retaining an unbounded
+second in-memory copy.
+
 Numeric increment, array union/append-missing-elements, field deletion, and
 request-time/server-timestamp transforms are implemented. Maximum, minimum,
 array-remove, and other transforms return an explicit unsupported error.
