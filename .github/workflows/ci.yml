@@ -67,3 +67,13 @@ jobs:
         run: cargo clippy --locked --all-targets --no-deps
       - name: Test Rust targets
         run: cargo test --locked --all-targets
+      - name: Build release binary for restart tests
+        run: cargo build --locked --release
+      - name: Test durable Node/Admin process restarts
+        run: npm run test:persistence --prefix examples/node-app
+      - name: Install Chromium for durable browser restart test
+        run: npx --prefix examples/web-app playwright install --with-deps chromium
+      - name: Test durable Firebase browser process restart
+        run: npm run test:persistence --prefix examples/web-app
+      - name: Test durable Functions outbox crash recovery
+        run: npm run test:persistence --prefix functions-runtime

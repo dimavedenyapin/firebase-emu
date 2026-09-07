@@ -1,9 +1,10 @@
 # Firebase emulator in Rust
 
-One loopback-only, in-memory process serves Firestore gRPC and browser
+One loopback-only process serves Firestore gRPC and browser
 WebChannel (8080), Auth REST (9099), Storage REST (9199), and optional Firebase
 Functions (5001). It is intended for local development and tests with `demo-`
-projects, not production traffic.
+projects, not production traffic. The backwards-compatible default is
+in-memory; `--data-dir` opts into durable local persistence.
 
 ## Install and run
 
@@ -50,7 +51,7 @@ Once `v0.1.0` is published, Node 18+ users can run its verified prebuilt asset
 without installing Rust:
 
 ```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.0 -- --no-functions
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.0 --no-functions
 ```
 
 The launcher downloads the matching public GitHub Release archive, verifies it
@@ -68,7 +69,68 @@ GCLOUD_PROJECT=demo-sdk-compat ./target/release/firebase-emu --no-functions
 
 `FIREBASE_EMU_HOST` selects a loopback IP. `FIRESTORE_EMU_PORT`,
 `FIREBASE_AUTH_EMU_PORT`, and `FIREBASE_STORAGE_EMU_PORT` change the three
-service ports. Data is lost when the process stops.
+service ports.
+
+## Durable local data
+
+No option, or the explicit `--in-memory` option, preserves the historical
+ephemeral behavior. Use a dedicated directory to retain acknowledged data:
+
+```sh
+firebase-emu --data-dir "./.firebase-emu-data" --no-functions
+firebase-emu --data-dir "./local data/firebase" --no-functions
+```
+
+These options are newer than `v0.1.0`; use a binary built from this branch until
+the next release is published. After that release, the GitHub `npx` launcher
+for that tag accepts the same arguments.
+
+`--data-dir` and `--in-memory` conflict and are rejected. Relative data paths
+resolve from the process working directory, independently of `--config`; the
+startup log prints the canonical SQLite and object paths. The GitHub `npx`
+launcher forwards options directly, so do not insert an extra `--`. No custom
+field is read from `firebase.json`.
+
+The directory contains `firebase-emu.sqlite3` in SQLite WAL mode, an exclusive
+owner lock, opaque object files under `blobs/`, and crash-recovery files under
+`tmp/`. SQLite is compiled into every release binary; no database server or
+installed SQLite library is required. Firestore protobufs are stored without a
+JSON conversion, preserving 64-bit integers, timestamps, bytes, references,
+geopoints, nested values, NaN, full resource names, and document timestamps.
+Auth users, password material, custom claims, ID/refresh sessions, revocation
+state, and Storage metadata are durable. Active Firestore transaction handles,
+open HTTP requests, sockets, and incomplete resumable uploads are process-local.
+
+One bounded 128-entry writer queue serializes SQLite transactions on a
+dedicated OS thread. Up to eight blocking read connections can run
+concurrently; every connection has a 5-second busy timeout and an 8 MiB SQLite
+page-cache target. Acknowledged writes use WAL with `synchronous=FULL`.
+Persistent queries narrow in SQLite and then reuse the existing Rust query
+evaluator, so complex queries remain scans and hold only their transient result
+set in memory—there is no unbounded full database mirror or result cache.
+
+Storage finalization flushes a unique temporary blob, renames it to an
+immutable opaque UUID name, then commits metadata and its event. Overwrite and
+delete cleanup occurs only after that commit. Startup discards incomplete temp
+files and unreferenced blobs; a missing referenced blob or corrupt/newer schema
+stops startup instead of resetting data. A retained exclusive lock rejects a
+second process using the same directory.
+
+Supported Firestore and Storage triggers use a durable outbox when Functions
+are configured. Pending/in-flight work is recovered after restart, stable event
+IDs are retried up to five times with bounded backoff, and terminal failures are
+reported by Functions status/drain. Delivery is at least once: a crash after a
+handler succeeds but before its durable acknowledgement can deliver the same
+event ID again, and one source event targeting several handlers can repeat the
+whole matching group. Exactly-once delivery is not promised. Starting with
+`--no-functions` retains existing pending work without delivering it.
+
+The existing Firestore ClearData API durably resets only its requested
+project/database and does not emit create events during restart rehydration.
+There is no automatic reset, import, or seed. To reset every service, stop the
+owner and remove that one explicitly selected data directory. For backup, stop
+the emulator before copying the whole directory (database, any `-wal`/`-shm`,
+and `blobs/`); copying only a live main database file is not a valid backup.
 
 ## Functions runtime
 

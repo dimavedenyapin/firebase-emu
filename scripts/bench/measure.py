@@ -133,6 +133,20 @@ def free_port():
     return port
 
 
+def directory_bytes(path):
+    """Return logical file bytes beneath path without following symlinks."""
+    total = 0
+    if not path or not os.path.isdir(path):
+        return total
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except FileNotFoundError:
+                pass
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["no-functions", "functions"], required=True)
@@ -149,6 +163,8 @@ def main():
     ap.add_argument("--ready-timeout", type=int, default=30)
     ap.add_argument("--out", default=None, help="raw JSONL output path")
     ap.add_argument("--label", default="")
+    ap.add_argument("--data-dir", default=None,
+                    help="enable SQLite/blob persistence in this directory")
     args = ap.parse_args()
 
     for p in (args.firestore_port, args.auth_port, args.storage_port, args.functions_port):
@@ -169,6 +185,8 @@ def main():
         node22 = os.environ.get("FIREBASE_FUNCTIONS_NODE_22") or subprocess.run(
             ["node", "-p", "process.execPath"], capture_output=True, text=True).stdout.strip()
         env["FIREBASE_FUNCTIONS_NODE_22"] = node22
+        env["FIREBASE_FUNCTIONS_ADAPTER"] = os.path.join(
+            REPO, "functions-runtime/adapter.cjs")
         env["FIXTURE_EVENT_LOG"] = os.path.join(
             "/tmp", f"bench-events-{os.getpid()}-{int(time.time())}.jsonl")
         cmd = [BINARY, "--config",
@@ -176,6 +194,10 @@ def main():
                "--project", args.project]
     else:
         cmd = [BINARY, "--no-functions"]
+    if args.data_dir:
+        cmd.extend(["--data-dir", os.path.abspath(args.data_dir)])
+    else:
+        cmd.append("--in-memory")
 
     samples = []
     t_spawn = time.monotonic()
@@ -329,7 +351,12 @@ def main():
             "workload": workload_result,
             "workload_summary": summarize(
                 [{"rss_kb": s["workload_rss_kb"] or 0, "cpu_pct": None} for s in samples
-                 if s.get("workload_rss_kb")]) if args.workload else None,
+                if s.get("workload_rss_kb")]) if args.workload else None,
+            "storage": {
+                "mode": "persistent" if args.data_dir else "in-memory",
+                "data_dir": os.path.abspath(args.data_dir) if args.data_dir else None,
+                "logical_bytes": directory_bytes(args.data_dir),
+            },
             "note": ("tree RSS sums process RSS; shared memory is double-counted; "
                      "workload generator is reported separately and excluded from emulator totals"),
         }

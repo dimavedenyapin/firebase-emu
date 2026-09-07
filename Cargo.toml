@@ -10,16 +10,19 @@ axum07 = { package = "axum", version = "0.7" }
 base64 = "0.22"
 bytes = "1"
 crc32c = "0.6"
+fs2 = "0.4"
 libc = "0.2"
 prost = "0.13"
 prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.12"
 tower-http = { version = "0.6", features = ["cors"] }
+thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]

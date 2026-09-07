@@ -3,6 +3,9 @@
 /.firebase/
 /firebase-debug.log
 /*-debug.log
+/.firebase-emu-data/
+__pycache__/
+*.pyc
 
 **/node_modules/
 **/dist/

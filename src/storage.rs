@@ -1,11 +1,13 @@
-//! Small in-memory Google Cloud Storage compatible REST emulator.
-//!
-//! The implementation intentionally keeps all data in process memory.  It is
-//! aimed at local SDK and integration tests, not at untrusted networks.
+//! Small Google Cloud Storage compatible REST emulator.
 
+use crate::persistence::{Error as PersistenceError, Persistence};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rusqlite::OptionalExtension;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,12 +20,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const RESUMABLE_UPLOAD_TTL_SECS: u64 = 60 * 60;
+/// Maximum accepted object size and cumulative incomplete resumable upload.
+/// This bounds request and session buffering while retaining current SDK fixtures.
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 fn crc32c_base64(bytes: &[u8]) -> String {
     BASE64.encode(crc32c::crc32c(bytes).to_be_bytes())
@@ -32,6 +37,7 @@ fn crc32c_base64(bytes: &[u8]) -> String {
 #[derive(Clone, Default)]
 struct StorageState {
     data: Arc<RwLock<StorageData>>,
+    persistence: Option<Persistence>,
 }
 
 #[derive(Default)]
@@ -45,7 +51,10 @@ struct StorageData {
 struct StoredObject {
     bucket: String,
     name: String,
-    bytes: Bytes,
+    bytes: Option<Bytes>,
+    blob_name: Option<String>,
+    size: u64,
+    crc32c: String,
     content_type: String,
     metadata: HashMap<String, String>,
     cache_control: Option<String>,
@@ -54,7 +63,19 @@ struct StoredObject {
     generation: u64,
     created: String,
     updated: String,
-    download_token: Uuid,
+    download_token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredMetadata {
+    content_type: String,
+    metadata: HashMap<String, String>,
+    cache_control: Option<String>,
+    content_disposition: Option<String>,
+    content_encoding: Option<String>,
+    download_token: String,
+    size: u64,
+    crc32c: String,
 }
 
 #[derive(Clone)]
@@ -76,6 +97,157 @@ fn unix_now() -> u64 {
 fn prune_expired_uploads(data: &mut StorageData, now: u64) {
     data.uploads
         .retain(|_, upload| upload.created_at.saturating_add(RESUMABLE_UPLOAD_TTL_SECS) > now);
+}
+
+fn persistence_failure(error: impl std::fmt::Display) -> Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &format!("Storage persistence failed: {error}"),
+    )
+}
+
+fn blob_path(directory: &FsPath, name: &str) -> Result<PathBuf, PersistenceError> {
+    let id = Uuid::parse_str(name)
+        .map_err(|_| PersistenceError::Corrupt(format!("invalid Storage blob id {name:?}")))?;
+    if id.to_string() != name {
+        return Err(PersistenceError::Corrupt(format!(
+            "non-canonical Storage blob id {name:?}"
+        )));
+    }
+    Ok(directory.join(name))
+}
+
+fn metadata_json(object: &StoredObject) -> Result<String, PersistenceError> {
+    serde_json::to_string(&StoredMetadata {
+        content_type: object.content_type.clone(),
+        metadata: object.metadata.clone(),
+        cache_control: object.cache_control.clone(),
+        content_disposition: object.content_disposition.clone(),
+        content_encoding: object.content_encoding.clone(),
+        download_token: object.download_token.clone(),
+        size: object.size,
+        crc32c: object.crc32c.clone(),
+    })
+    .map_err(|error| PersistenceError::Corrupt(format!("invalid Storage metadata: {error}")))
+}
+
+fn stored_object(
+    bucket: String,
+    name: String,
+    blob_name: String,
+    metadata: String,
+    generation: i64,
+    created: String,
+    updated: String,
+) -> Result<StoredObject, PersistenceError> {
+    let metadata: StoredMetadata = serde_json::from_str(&metadata).map_err(|error| {
+        PersistenceError::Corrupt(format!(
+            "invalid Storage metadata for {bucket}/{name}: {error}"
+        ))
+    })?;
+    if generation <= 0 {
+        return Err(PersistenceError::Corrupt(format!(
+            "negative Storage generation for {bucket}/{name}"
+        )));
+    }
+    Ok(StoredObject {
+        bucket,
+        name,
+        bytes: None,
+        blob_name: Some(blob_name),
+        size: metadata.size,
+        crc32c: metadata.crc32c,
+        content_type: metadata.content_type,
+        metadata: metadata.metadata,
+        cache_control: metadata.cache_control,
+        content_disposition: metadata.content_disposition,
+        content_encoding: metadata.content_encoding,
+        generation: generation as u64,
+        created,
+        updated,
+        download_token: metadata.download_token,
+    })
+}
+
+async fn recover_blobs(persistence: &Persistence) -> Result<(), PersistenceError> {
+    let referenced: HashSet<String> = persistence
+        .read(|connection| {
+            let mut statement = connection.prepare("SELECT blob_name FROM storage_objects")?;
+            let names = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<HashSet<String>, _>>()?;
+            Ok(names)
+        })
+        .await?;
+    for name in &referenced {
+        let path = blob_path(persistence.blobs_dir(), name)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            PersistenceError::Corrupt(format!(
+                "Storage metadata references missing blob {name}: {error}"
+            ))
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(PersistenceError::Corrupt(format!(
+                "Storage metadata references non-file blob {name}"
+            )));
+        }
+    }
+    let blobs = persistence.blobs_dir().to_owned();
+    let temporary = persistence.temporary_dir().to_owned();
+    tokio::task::spawn_blocking(move || -> Result<(), PersistenceError> {
+        for entry in fs::read_dir(&temporary)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() || entry.file_type()?.is_symlink() {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        for entry in fs::read_dir(&blobs)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !referenced.contains(&name) {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| PersistenceError::Join(error.to_string()))??;
+    Ok(())
+}
+
+async fn persistent_object(
+    persistence: &Persistence,
+    bucket: String,
+    name: String,
+) -> Result<Option<StoredObject>, PersistenceError> {
+    persistence
+        .read(move |connection| {
+            let row = connection
+                .query_row(
+                    "SELECT blob_name, metadata_json, generation, created, updated \
+                     FROM storage_objects WHERE bucket=?1 AND name=?2",
+                    rusqlite::params![bucket, name],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(blob, metadata, generation, created, updated)| {
+                stored_object(bucket, name, blob, metadata, generation, created, updated)
+            })
+            .transpose()
+        })
+        .await
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -112,13 +284,17 @@ struct ListQuery {
     page_token: Option<String>,
 }
 
-/// Build a Storage REST router with its own isolated, in-memory state.
-///
-/// Mount this router directly on the listener bound to port 9199.
-pub fn router() -> Router {
-    let state = StorageState::default();
+/// Build a Storage REST router. `None` preserves the historical in-memory mode.
+pub async fn router(persistence: Option<Persistence>) -> Result<Router, PersistenceError> {
+    if let Some(store) = &persistence {
+        recover_blobs(store).await?;
+    }
+    let state = StorageState {
+        persistence,
+        ..StorageState::default()
+    };
 
-    Router::new()
+    Ok(Router::new()
         .route("/storage/v1/b/{bucket}", get(bucket_metadata))
         .route("/storage/v1/b/{bucket}/o", get(list_objects))
         .route(
@@ -152,9 +328,9 @@ pub fn router() -> Router {
                 .put(put_signed_object)
                 .delete(delete_object),
         )
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn bucket_metadata(Path(bucket): Path<String>) -> Response {
@@ -313,6 +489,9 @@ async fn resumable_put(
             "upload offset does not match received size",
         );
     }
+    if pending.bytes.len().saturating_add(body.len()) > MAX_UPLOAD_BYTES {
+        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "object exceeds 64 MiB limit");
+    }
     pending.bytes.extend_from_slice(&body);
     if !command.is_empty() && !command.contains("finalize") {
         let mut response = StatusCode::OK.into_response();
@@ -367,6 +546,17 @@ async fn save_object(
     metadata: UploadMetadata,
     fallback_content_type: Option<String>,
 ) -> Response {
+    if let Some(persistence) = &state.persistence {
+        return save_persistent_object(
+            persistence.clone(),
+            bucket,
+            name,
+            bytes,
+            metadata,
+            fallback_content_type,
+        )
+        .await;
+    }
     let now = timestamp_now();
     let mut data = state.data.write().await;
     data.next_generation += 1;
@@ -378,7 +568,10 @@ async fn save_object(
     let object = StoredObject {
         bucket: bucket.clone(),
         name: name.clone(),
-        bytes,
+        size: bytes.len() as u64,
+        crc32c: crc32c_base64(&bytes),
+        bytes: Some(bytes),
+        blob_name: None,
         content_type: metadata
             .content_type
             .or(fallback_content_type)
@@ -390,7 +583,7 @@ async fn save_object(
         generation,
         created: existing_created.unwrap_or_else(|| now.clone()),
         updated: now,
-        download_token: Uuid::new_v4(),
+        download_token: Uuid::new_v4().to_string(),
     };
     let value = object_json(&object);
     data.objects.insert((bucket, name), object);
@@ -398,11 +591,272 @@ async fn save_object(
     Json(value).into_response()
 }
 
+async fn save_persistent_object(
+    persistence: Persistence,
+    bucket: String,
+    name: String,
+    bytes: Bytes,
+    metadata: UploadMetadata,
+    fallback_content_type: Option<String>,
+) -> Response {
+    let blob_name = Uuid::new_v4().to_string();
+    let temporary_name = format!("upload-{}.tmp", Uuid::new_v4());
+    let temporary_path = persistence.temporary_dir().join(temporary_name);
+    let blob_path = persistence.blobs_dir().join(&blob_name);
+    let contents = bytes.to_vec();
+    let write_path = temporary_path.clone();
+    let final_path = blob_path.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&write_path)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&write_path, &final_path)?;
+        sync_parent_directory(&final_path)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| PersistenceError::Join(error.to_string()))
+    .and_then(|result| result.map_err(PersistenceError::Io))
+    {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return persistence_failure(error);
+    }
+
+    let now = timestamp_now();
+    let size = bytes.len() as u64;
+    let checksum = crc32c_base64(&bytes);
+    let content_type = metadata
+        .content_type
+        .or(fallback_content_type)
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    let custom_metadata = metadata.metadata;
+    let cache_control = metadata.cache_control;
+    let content_disposition = metadata.content_disposition;
+    let content_encoding = metadata.content_encoding;
+    let persistence_for_write = persistence.clone();
+    let committed_blob_name = blob_name.clone();
+    let result = persistence
+        .write(move |connection| {
+            let transaction = connection.transaction()?;
+            let old = transaction
+                .query_row(
+                    "SELECT blob_name, created FROM storage_objects WHERE bucket=?1 AND name=?2",
+                    rusqlite::params![bucket, name],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            transaction.execute(
+                "UPDATE counters SET value=value+1 WHERE name='storage_generation'",
+                [],
+            )?;
+            let generation: i64 = transaction.query_row(
+                "SELECT value FROM counters WHERE name='storage_generation'",
+                [],
+                |row| row.get(0),
+            )?;
+            let object = StoredObject {
+                bucket: bucket.clone(),
+                name: name.clone(),
+                bytes: None,
+                blob_name: Some(committed_blob_name.clone()),
+                size,
+                crc32c: checksum,
+                content_type,
+                metadata: custom_metadata,
+                cache_control,
+                content_disposition,
+                content_encoding,
+                generation: generation as u64,
+                created: old
+                    .as_ref()
+                    .map(|(_, created)| created.clone())
+                    .unwrap_or_else(|| now.clone()),
+                updated: now,
+                download_token: Uuid::new_v4().to_string(),
+            };
+            let public = object_json(&object);
+            let encoded = metadata_json(&object)?;
+            transaction.execute(
+                "INSERT INTO storage_objects(bucket,name,blob_name,metadata_json,generation,created,updated) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7) \
+                 ON CONFLICT(bucket,name) DO UPDATE SET blob_name=excluded.blob_name, \
+                 metadata_json=excluded.metadata_json,generation=excluded.generation,updated=excluded.updated",
+                rusqlite::params![
+                    object.bucket,
+                    object.name,
+                    committed_blob_name,
+                    encoded,
+                    generation,
+                    object.created,
+                    object.updated
+                ],
+            )?;
+            persistence_for_write.insert_outbox(
+                &transaction,
+                &[crate::functions::storage_outbox_record("finalize", public)],
+            )?;
+            transaction.commit()?;
+            Ok((object, old.map(|(blob, _)| blob)))
+        })
+        .await;
+    let (object, old_blob) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&blob_path).await;
+            return persistence_failure(error);
+        }
+    };
+    crate::functions::outbox_committed();
+    if let Some(old_blob) = old_blob.filter(|old| old != &blob_name) {
+        if let Ok(path) = blob_path_for_cleanup(&persistence, &old_blob) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+    Json(object_json(&object)).into_response()
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &FsPath) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &FsPath) -> Result<(), std::io::Error> {
+    // Windows has no stable Rust API for flushing directory metadata. The
+    // uniquely named destination avoids replace-in-place semantics there;
+    // the blob itself was flushed before rename and startup reconciliation
+    // removes any rename that was not followed by a SQLite commit.
+    Ok(())
+}
+
+fn blob_path_for_cleanup(
+    persistence: &Persistence,
+    name: &str,
+) -> Result<PathBuf, PersistenceError> {
+    blob_path(persistence.blobs_dir(), name)
+}
+
+async fn load_blob(
+    persistence: &Persistence,
+    object: &StoredObject,
+) -> Result<Bytes, PersistenceError> {
+    let name = object
+        .blob_name
+        .as_deref()
+        .ok_or_else(|| PersistenceError::Corrupt("persistent object has no blob id".into()))?;
+    let path = blob_path(persistence.blobs_dir(), name)?;
+    let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+        PersistenceError::Corrupt(format!("failed to inspect Storage blob {name}: {error}"))
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(PersistenceError::Corrupt(format!(
+            "Storage blob {name} is not a regular file"
+        )));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        PersistenceError::Corrupt(format!("failed to read Storage blob {name}: {error}"))
+    })?;
+    if bytes.len() as u64 != object.size || crc32c_base64(&bytes) != object.crc32c {
+        return Err(PersistenceError::Corrupt(format!(
+            "Storage blob {name} does not match committed metadata"
+        )));
+    }
+    Ok(Bytes::from(bytes))
+}
+
+async fn delete_persistent_object(
+    persistence: Persistence,
+    bucket: String,
+    name: String,
+) -> Response {
+    let persistence_for_write = persistence.clone();
+    let result = persistence
+        .write(move |connection| {
+            let transaction = connection.transaction()?;
+            let row = transaction
+                .query_row(
+                    "SELECT blob_name, metadata_json, generation, created, updated \
+                     FROM storage_objects WHERE bucket=?1 AND name=?2",
+                    rusqlite::params![bucket, name],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((blob, metadata, generation, created, updated)) = row else {
+                return Ok(None);
+            };
+            let object = stored_object(
+                bucket.clone(),
+                name.clone(),
+                blob.clone(),
+                metadata,
+                generation,
+                created,
+                updated,
+            )?;
+            transaction.execute(
+                "DELETE FROM storage_objects WHERE bucket=?1 AND name=?2",
+                rusqlite::params![bucket, name],
+            )?;
+            persistence_for_write.insert_outbox(
+                &transaction,
+                &[crate::functions::storage_outbox_record(
+                    "delete",
+                    object_json(&object),
+                )],
+            )?;
+            transaction.commit()?;
+            Ok(Some(blob))
+        })
+        .await;
+    match result {
+        Ok(Some(blob)) => {
+            crate::functions::outbox_committed();
+            if let Ok(path) = blob_path_for_cleanup(&persistence, &blob) {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
+        Err(error) => persistence_failure(error),
+    }
+}
+
 async fn get_object(
     State(state): State<StorageState>,
     Path((bucket, object)): Path<(String, String)>,
     Query(query): Query<ObjectQuery>,
 ) -> Response {
+    if let Some(persistence) = &state.persistence {
+        return match persistent_object(persistence, bucket, object).await {
+            Ok(Some(mut object)) if query.alt.as_deref() == Some("media") => {
+                match load_blob(persistence, &object).await {
+                    Ok(bytes) => {
+                        object.bytes = Some(bytes);
+                        media_response(object)
+                    }
+                    Err(error) => persistence_failure(error),
+                }
+            }
+            Ok(Some(object)) => Json(object_json(&object)).into_response(),
+            Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
+            Err(error) => persistence_failure(error),
+        };
+    }
     let stored = state
         .data
         .read()
@@ -421,6 +875,19 @@ async fn get_signed_object(
     State(state): State<StorageState>,
     Path((bucket, object)): Path<(String, String)>,
 ) -> Response {
+    if let Some(persistence) = &state.persistence {
+        return match persistent_object(persistence, bucket, object).await {
+            Ok(Some(mut object)) => match load_blob(persistence, &object).await {
+                Ok(bytes) => {
+                    object.bytes = Some(bytes);
+                    media_response(object)
+                }
+                Err(error) => persistence_failure(error),
+            },
+            Ok(None) => api_error(StatusCode::NOT_FOUND, "object not found"),
+            Err(error) => persistence_failure(error),
+        };
+    }
     let stored = state
         .data
         .read()
@@ -434,12 +901,11 @@ async fn get_signed_object(
 }
 
 fn media_response(object: StoredObject) -> Response {
-    let crc32c = crc32c_base64(&object.bytes);
-    let mut response = object.bytes.into_response();
+    let mut response = object.bytes.unwrap_or_default().into_response();
     let headers = response.headers_mut();
     headers.insert(
         HeaderName::from_static("x-goog-hash"),
-        HeaderValue::from_str(&format!("crc32c={crc32c}"))
+        HeaderValue::from_str(&format!("crc32c={}", object.crc32c))
             .expect("base64 checksum is a valid header value"),
     );
     headers.insert(
@@ -471,6 +937,9 @@ async fn delete_object(
     State(state): State<StorageState>,
     Path((bucket, object)): Path<(String, String)>,
 ) -> Response {
+    if let Some(persistence) = &state.persistence {
+        return delete_persistent_object(persistence.clone(), bucket, object).await;
+    }
     let removed = state.data.write().await.objects.remove(&(bucket, object));
     if let Some(object) = removed {
         crate::functions::storage_changed("delete", object_json(&object));
@@ -487,6 +956,44 @@ async fn list_objects(
 ) -> Response {
     let prefix = query.prefix.unwrap_or_default();
     let delimiter = query.delimiter.filter(|value| !value.is_empty());
+    if let Some(persistence) = &state.persistence {
+        let bucket_for_read = bucket.clone();
+        let prefix_for_read = prefix.clone();
+        let matching = persistence
+            .read(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT name, blob_name, metadata_json, generation, created, updated \
+                     FROM storage_objects \
+                     WHERE bucket=?1 AND substr(name,1,length(?2))=?2 ORDER BY name",
+                )?;
+                let mut rows =
+                    statement.query(rusqlite::params![bucket_for_read, prefix_for_read])?;
+                let mut objects = Vec::new();
+                while let Some(row) = rows.next()? {
+                    objects.push(stored_object(
+                        bucket_for_read.clone(),
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    )?);
+                }
+                Ok(objects)
+            })
+            .await;
+        return match matching {
+            Ok(matching) => list_response(
+                matching,
+                prefix,
+                delimiter,
+                query.page_token,
+                query.max_results,
+            ),
+            Err(error) => persistence_failure(error),
+        };
+    }
     let data = state.data.read().await;
     let mut matching: Vec<_> = data
         .objects
@@ -496,6 +1003,22 @@ async fn list_objects(
         .collect();
     matching.sort_by(|left, right| left.name.cmp(&right.name));
 
+    list_response(
+        matching,
+        prefix,
+        delimiter,
+        query.page_token,
+        query.max_results,
+    )
+}
+
+fn list_response(
+    matching: Vec<StoredObject>,
+    prefix: String,
+    delimiter: Option<String>,
+    page_token: Option<String>,
+    max_results: Option<usize>,
+) -> Response {
     let mut prefixes = BTreeSet::new();
     let mut items = Vec::new();
     for object in matching {
@@ -510,7 +1033,7 @@ async fn list_objects(
         items.push(object_json(&object));
     }
 
-    let offset = match query.page_token {
+    let offset = match page_token {
         Some(token) => match BASE64
             .decode(token)
             .ok()
@@ -522,7 +1045,7 @@ async fn list_objects(
         },
         None => 0,
     };
-    let limit = query.max_results.unwrap_or(1000).clamp(1, 1000);
+    let limit = max_results.unwrap_or(1000).clamp(1, 1000);
     let mut entries: Vec<(String, Option<Value>)> = items
         .into_iter()
         .map(|item| (item["name"].as_str().unwrap().to_owned(), Some(item)))
@@ -548,7 +1071,6 @@ async fn list_objects(
 fn object_json(object: &StoredObject) -> Value {
     let encoded_bucket = percent_encode(&object.bucket);
     let encoded_name = percent_encode(&object.name);
-    let crc32c = crc32c_base64(&object.bytes);
     let mut value = json!({
         "kind": "storage#object",
         "id": format!("{}/{}/{}", object.bucket, object.name, object.generation),
@@ -559,8 +1081,8 @@ fn object_json(object: &StoredObject) -> Value {
         "generation": object.generation.to_string(),
         "metageneration": "1",
         "contentType": object.content_type,
-        "size": object.bytes.len().to_string(),
-        "crc32c": crc32c,
+        "size": object.size.to_string(),
+        "crc32c": object.crc32c,
         "timeCreated": object.created,
         "updated": object.updated,
         "etag": format!("\"{}\"", object.generation),
@@ -737,6 +1259,20 @@ fn timestamp_from_unix(seconds: i64) -> String {
 mod tests {
     use super::*;
 
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("firebase-emu-storage-{name}-{}", Uuid::new_v4()))
+    }
+
+    async fn persistent_state(root: &FsPath) -> (Persistence, StorageState) {
+        let persistence = Persistence::open(root.to_owned(), false).await.unwrap();
+        recover_blobs(&persistence).await.unwrap();
+        let state = StorageState {
+            persistence: Some(persistence.clone()),
+            ..StorageState::default()
+        };
+        (persistence, state)
+    }
+
     #[test]
     fn parses_binary_multipart_upload() {
         let body = b"--edge\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{\"name\":\"folder/a.bin\",\"metadata\":{\"owner\":\"test\"}}\r\n--edge\r\nContent-Type: application/octet-stream\r\n\r\nabc\x00\xffxyz\r\n--edge--\r\n";
@@ -807,7 +1343,7 @@ mod tests {
             .get(&("bucket".to_owned(), "file.txt".to_owned()))
             .unwrap()
             .clone();
-        assert_eq!(second.bytes.as_ref(), b"two");
+        assert_eq!(second.bytes.as_deref(), Some(b"two".as_slice()));
         assert!(second.generation > first.generation);
         assert_eq!(second.created, first.created);
         assert_eq!(
@@ -865,6 +1401,221 @@ mod tests {
             prefixes,
             BTreeSet::from(["logs/2024/".to_owned(), "logs/2025/".to_owned()])
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_overwrite_delete_and_reopen_are_consistent() {
+        let root = temporary("reopen");
+        let (first_store, state) = persistent_state(&root).await;
+        assert_eq!(
+            save_object(
+                &state,
+                "bucket".into(),
+                "folder/file.txt".into(),
+                Bytes::from_static(b"first"),
+                UploadMetadata {
+                    metadata: HashMap::from([("owner".into(), "test".into())]),
+                    ..UploadMetadata::default()
+                },
+                Some("text/plain".into()),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let first = persistent_object(&first_store, "bucket".into(), "folder/file.txt".into())
+            .await
+            .unwrap()
+            .unwrap();
+        let first_blob = first.blob_name.clone().unwrap();
+        let created = first.created.clone();
+        assert_eq!(
+            load_blob(&first_store, &first).await.unwrap(),
+            b"first".as_slice()
+        );
+
+        assert_eq!(
+            save_object(
+                &state,
+                "bucket".into(),
+                "folder/file.txt".into(),
+                Bytes::from_static(b"second"),
+                UploadMetadata::default(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let second = persistent_object(&first_store, "bucket".into(), "folder/file.txt".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.generation > first.generation);
+        assert_eq!(second.created, created);
+        assert_eq!(
+            load_blob(&first_store, &second).await.unwrap(),
+            b"second".as_slice()
+        );
+        assert!(!first_store.blobs_dir().join(first_blob).exists());
+
+        drop(state);
+        drop(first_store);
+        let (second_store, reopened) = persistent_state(&root).await;
+        let object = persistent_object(&second_store, "bucket".into(), "folder/file.txt".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            load_blob(&second_store, &object).await.unwrap(),
+            b"second".as_slice()
+        );
+        assert_eq!(
+            delete_object(
+                State(reopened.clone()),
+                Path(("bucket".into(), "folder/file.txt".into()))
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(
+            persistent_object(&second_store, "bucket".into(), "folder/file.txt".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(fs::read_dir(second_store.blobs_dir())
+            .unwrap()
+            .next()
+            .is_none());
+        drop(reopened);
+        drop(second_store);
+        let (third_store, third_state) = persistent_state(&root).await;
+        assert!(
+            persistent_object(&third_store, "bucket".into(), "folder/file.txt".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(third_state);
+        drop(third_store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_discards_temporary_and_orphan_blob_files() {
+        let root = temporary("orphans");
+        let persistence = Persistence::open(root.clone(), false).await.unwrap();
+        let orphan = persistence.blobs_dir().join(Uuid::new_v4().to_string());
+        let temporary = persistence.temporary_dir().join("incomplete-upload.tmp");
+        fs::write(&orphan, b"orphan").unwrap();
+        fs::write(&temporary, b"partial").unwrap();
+        recover_blobs(&persistence).await.unwrap();
+        assert!(!orphan.exists());
+        assert!(!temporary.exists());
+        drop(persistence);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_missing_or_unsafe_referenced_blob() {
+        for blob in [Uuid::new_v4().to_string(), "../outside".to_owned()] {
+            let root = temporary("unsafe-reference");
+            let persistence = Persistence::open(root.clone(), false).await.unwrap();
+            let metadata = serde_json::to_string(&StoredMetadata {
+                content_type: "application/octet-stream".into(),
+                metadata: HashMap::new(),
+                cache_control: None,
+                content_disposition: None,
+                content_encoding: None,
+                download_token: Uuid::new_v4().to_string(),
+                size: 1,
+                crc32c: crc32c_base64(b"x"),
+            })
+            .unwrap();
+            let blob_for_write = blob.clone();
+            persistence
+                .write(move |connection| {
+                    connection.execute(
+                        "INSERT INTO storage_objects(bucket,name,blob_name,metadata_json,generation,created,updated) \
+                         VALUES ('bucket','object',?1,?2,1,'now','now')",
+                        rusqlite::params![blob_for_write, metadata],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let error = recover_blobs(&persistence).await.unwrap_err().to_string();
+            if blob.starts_with("..") {
+                assert!(error.contains("invalid Storage blob id"), "{error}");
+            } else {
+                assert!(error.contains("missing blob"), "{error}");
+            }
+            assert!(!root.join("outside").exists());
+            drop(persistence);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_mutations_commit_storage_outbox_envelopes() {
+        let root = temporary("outbox");
+        let persistence = Persistence::open(root.clone(), true).await.unwrap();
+        let state = StorageState {
+            persistence: Some(persistence.clone()),
+            ..StorageState::default()
+        };
+        assert_eq!(
+            save_object(
+                &state,
+                "bucket".into(),
+                "event.txt".into(),
+                Bytes::from_static(b"event"),
+                UploadMetadata::default(),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_object(
+                State(state.clone()),
+                Path(("bucket".into(), "event.txt".into()))
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let rows: Vec<(String, Value)> = persistence
+            .read(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT source,payload FROM event_outbox ORDER BY id")?;
+                let mut rows = statement.query([])?;
+                let mut result = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let source: String = row.get(0)?;
+                    let payload: Vec<u8> = row.get(1)?;
+                    let payload = serde_json::from_slice(&payload).map_err(|error| {
+                        PersistenceError::Corrupt(format!("invalid test outbox JSON: {error}"))
+                    })?;
+                    result.push((source, payload));
+                }
+                Ok(result)
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "storage");
+        assert_eq!(rows[0].1["kind"], "finalize");
+        assert_eq!(rows[0].1["object"]["name"], "event.txt");
+        assert_eq!(rows[1].0, "storage");
+        assert_eq!(rows[1].1["kind"], "delete");
+        assert_eq!(rows[1].1["object"]["name"], "event.txt");
+        drop(state);
+        drop(persistence);
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -1000,8 +1751,8 @@ mod protocol_tests {
         assert_eq!(
             state.data.read().await.objects[&("bucket".into(), "file".into())]
                 .bytes
-                .as_ref(),
-            b"onetwo"
+                .as_deref(),
+            Some(b"onetwo".as_slice())
         );
     }
 

@@ -3,6 +3,7 @@ set -uo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 results_dir="${SDK_COMPAT_RESULTS_DIR:-$repo_dir/target/sdk-compat}"
+firebase_config="${SDK_COMPAT_FIREBASE_CONFIG:-$repo_dir/compat-sdk/firebase.json}"
 project_id="${GCLOUD_PROJECT:-demo-sdk-compat}"
 mode="${1:-all}"
 mkdir -p "$results_dir"
@@ -132,7 +133,7 @@ elif ! command -v java >/dev/null 2>&1; then
   record google.harness google unavailable "Java is required by the Google Firestore emulator"
 else
   printf -v nested_command '%q --target google' "$repo_dir/scripts/sdk-compat.sh"
-  run_case google.harness google pass "$repo_dir" "$firebase_bin" emulators:exec --project "$project_id" --config compat-sdk/firebase.json --only auth,firestore,storage "$nested_command"
+  run_case google.harness google pass "$repo_dir" "$firebase_bin" emulators:exec --project "$project_id" --config "$firebase_config" --only auth,firestore,storage "$nested_command"
 fi
 
 rust_binary="${FIREBASE_EMU_BIN:-$repo_dir/target/release/firebase-emu}"

@@ -1,3 +1,5 @@
+use prost::Message;
+use rusqlite::{params, types::Type, OptionalExtension};
 use std::{
     collections::BTreeMap,
     pin::Pin,
@@ -88,14 +90,49 @@ pub(crate) struct Store {
 pub(crate) struct FirestoreService {
     pub(crate) store: Arc<Mutex<Store>>,
     changes: broadcast::Sender<()>,
+    persistence: Option<crate::persistence::Persistence>,
 }
 impl Default for FirestoreService {
     fn default() -> Self {
         Self {
             store: Default::default(),
             changes: broadcast::channel(128).0,
+            persistence: None,
         }
     }
+}
+
+fn persistence_status(error: crate::persistence::Error) -> Status {
+    Status::unavailable(format!("durable Firestore operation failed: {error}"))
+}
+
+fn decode_document(column: usize, bytes: Vec<u8>) -> Result<Document, crate::persistence::Error> {
+    Document::decode(bytes.as_slice()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Blob, Box::new(error)).into()
+    })
+}
+
+fn write_name(write: &Write) -> Result<&str, Status> {
+    match write.operation.as_ref() {
+        Some(write::Operation::Update(document)) => Ok(&document.name),
+        Some(write::Operation::Delete(name)) => Ok(name),
+        Some(write::Operation::Transform(transform)) => Ok(&transform.document),
+        None => Err(Status::invalid_argument("write operation is required")),
+    }
+}
+
+fn validate_writes_database(database: &str, writes: &[Write]) -> Result<(), Status> {
+    database_document_prefix(database)?;
+    for write in writes {
+        let name = write_name(write)?;
+        validate_document_name(name)?;
+        if database_from_resource(name)? != database {
+            return Err(Status::invalid_argument(format!(
+                "write document does not belong to requested database: {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn timestamp_now() -> prost_types::Timestamp {
@@ -350,6 +387,176 @@ fn create_transaction(store: &mut Store, database: String) -> Vec<u8> {
     transaction
 }
 
+impl FirestoreService {
+    pub(crate) fn new(persistence: Option<crate::persistence::Persistence>) -> Self {
+        Self {
+            persistence,
+            ..Self::default()
+        }
+    }
+
+    async fn document(&self, name: &str) -> Result<Option<Document>, Status> {
+        if let Some(persistence) = &self.persistence {
+            let name = name.to_owned();
+            persistence
+                .read(move |connection| {
+                    let bytes = connection
+                        .query_row(
+                            "SELECT document FROM firestore_documents WHERE name=?1",
+                            params![name],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()?;
+                    bytes.map(|bytes| decode_document(0, bytes)).transpose()
+                })
+                .await
+                .map_err(persistence_status)
+        } else {
+            Ok(self.store.lock().await.documents.get(name).cloned())
+        }
+    }
+
+    pub(crate) async fn documents(&self, names: &[String]) -> Result<Vec<Document>, Status> {
+        if let Some(persistence) = &self.persistence {
+            let names = names.to_vec();
+            persistence
+                .read(move |connection| {
+                    let mut documents = Vec::new();
+                    let mut statement = connection
+                        .prepare("SELECT document FROM firestore_documents WHERE name=?1")?;
+                    for name in names {
+                        let bytes = statement
+                            .query_row(params![name], |row| row.get::<_, Vec<u8>>(0))
+                            .optional()?;
+                        if let Some(bytes) = bytes {
+                            documents.push(decode_document(0, bytes)?);
+                        }
+                    }
+                    Ok(documents)
+                })
+                .await
+                .map_err(persistence_status)
+        } else {
+            let store = self.store.lock().await;
+            Ok(names
+                .iter()
+                .filter_map(|name| store.documents.get(name).cloned())
+                .collect())
+        }
+    }
+
+    async fn database_documents(&self, database: &str) -> Result<Vec<Document>, Status> {
+        if let Some(persistence) = &self.persistence {
+            let database = database.to_owned();
+            persistence
+                .read(move |connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT document FROM firestore_documents \
+                         WHERE database_name=?1 ORDER BY name",
+                    )?;
+                    let mut rows = statement.query(params![database])?;
+                    let mut documents = Vec::new();
+                    while let Some(row) = rows.next()? {
+                        documents.push(decode_document(0, row.get(0)?)?);
+                    }
+                    Ok(documents)
+                })
+                .await
+                .map_err(persistence_status)
+        } else {
+            let prefix = database_document_prefix(database)?;
+            Ok(self
+                .store
+                .lock()
+                .await
+                .documents
+                .range(prefix.clone()..)
+                .take_while(|(name, _)| name.starts_with(&prefix))
+                .map(|(_, document)| document.clone())
+                .collect())
+        }
+    }
+
+    async fn persistent_writes(
+        &self,
+        database: String,
+        writes: Vec<Write>,
+        partial: bool,
+        write_time: prost_types::Timestamp,
+    ) -> Result<(Vec<WriteResult>, Vec<RpcStatus>, BTreeMap<String, Document>), Status> {
+        validate_writes_database(&database, &writes)?;
+        let persistence = self.persistence.clone().expect("persistent backend");
+        let operation_persistence = persistence.clone();
+        let outcome = persistence
+            .write(move |connection| {
+                let transaction = connection.transaction()?;
+                let mut names = writes
+                    .iter()
+                    .map(write_name)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("writes were validated")
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                names.sort();
+                names.dedup();
+                let mut documents = BTreeMap::new();
+                {
+                    let mut statement = transaction
+                        .prepare("SELECT document FROM firestore_documents WHERE name=?1")?;
+                    for name in &names {
+                        let bytes = statement
+                            .query_row(params![name], |row| row.get::<_, Vec<u8>>(0))
+                            .optional()?;
+                        if let Some(bytes) = bytes {
+                            documents.insert(name.clone(), decode_document(0, bytes)?);
+                        }
+                    }
+                }
+                let before = documents.clone();
+                let mut results = Vec::with_capacity(writes.len());
+                let mut statuses = Vec::with_capacity(writes.len());
+                for write in writes {
+                    match apply_write(&mut documents, write, &write_time) {
+                        Ok(result) => {
+                            results.push(result);
+                            statuses.push(RpcStatus::default());
+                        }
+                        Err(status) if partial => {
+                            results.push(WriteResult::default());
+                            statuses.push(status_proto(&status));
+                        }
+                        Err(status) => return Ok(Err(status)),
+                    }
+                }
+                for name in names {
+                    if let Some(document) = documents.get(&name) {
+                        transaction.execute(
+                            "INSERT INTO firestore_documents(name,database_name,document) \
+                             VALUES (?1,?2,?3) ON CONFLICT(name) DO UPDATE SET \
+                             database_name=excluded.database_name,document=excluded.document",
+                            params![name, database, document.encode_to_vec()],
+                        )?;
+                    } else {
+                        transaction.execute(
+                            "DELETE FROM firestore_documents WHERE name=?1",
+                            params![name],
+                        )?;
+                    }
+                }
+                let records = crate::functions::document_outbox_records(&before, &documents);
+                operation_persistence.insert_outbox(&transaction, &records)?;
+                transaction.commit()?;
+                Ok(Ok((results, statuses, documents)))
+            })
+            .await
+            .map_err(persistence_status)??;
+        crate::functions::outbox_committed();
+        let _ = self.changes.send(());
+        Ok(outcome)
+    }
+}
+
 #[tonic::async_trait]
 impl Firestore for FirestoreService {
     type ListenStream =
@@ -404,11 +611,8 @@ impl Firestore for FirestoreService {
     ) -> Result<Response<Document>, Status> {
         let name = request.into_inner().name;
         validate_document_name(&name)?;
-        let store = self.store.lock().await;
-        store
-            .documents
-            .get(&name)
-            .cloned()
+        self.document(&name)
+            .await?
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("document not found: {name}")))
     }
@@ -425,6 +629,67 @@ impl Firestore for FirestoreService {
             return Err(Status::invalid_argument(
                 "parent and collection_id are required",
             ));
+        }
+
+        if let Some(persistence) = &self.persistence {
+            let persistence = persistence.clone();
+            let operation_persistence = persistence.clone();
+            let parent = request.parent;
+            let collection_id = request.collection_id;
+            let requested_id = request.document_id;
+            let outcome = persistence
+                .write(move |connection| {
+                    let transaction = connection.transaction()?;
+                    let document_id = if requested_id.is_empty() {
+                        transaction.query_row(
+                            "UPDATE counters SET value=value+1 WHERE name='firestore_auto_id' RETURNING value",
+                            [],
+                            |row| row.get::<_, u64>(0),
+                        ).map(|id| format!("auto-{id:020}"))?
+                    } else {
+                        requested_id
+                    };
+                    let name = format!(
+                        "{}/{}/{}",
+                        parent.trim_end_matches('/'), collection_id, document_id
+                    );
+                    if let Err(status) = validate_document_name(&name) {
+                        return Ok(Err(status));
+                    }
+                    let database = match database_from_resource(&name) {
+                        Ok(database) => database,
+                        Err(status) => return Ok(Err(status)),
+                    };
+                    let exists = transaction.query_row(
+                        "SELECT 1 FROM firestore_documents WHERE name=?1",
+                        params![name],
+                        |_| Ok(()),
+                    ).optional()?.is_some();
+                    if exists {
+                        return Ok(Err(Status::already_exists(format!(
+                            "document already exists: {name}"
+                        ))));
+                    }
+                    let now = timestamp_now();
+                    document.name = name.clone();
+                    document.create_time = Some(now);
+                    document.update_time = Some(now);
+                    transaction.execute(
+                        "INSERT INTO firestore_documents(name,database_name,document) VALUES (?1,?2,?3)",
+                        params![name, database, document.encode_to_vec()],
+                    )?;
+                    let before = BTreeMap::new();
+                    let after = BTreeMap::from([(name, document.clone())]);
+                    let records = crate::functions::document_outbox_records(&before, &after);
+                    operation_persistence.insert_outbox(&transaction, &records)?;
+                    transaction.commit()?;
+                    Ok(Ok(document))
+                })
+                .await
+                .map_err(persistence_status)??;
+            crate::functions::outbox_committed();
+            let _ = self.changes.send(());
+            return Ok(Response::new(outcome));
         }
 
         let mut store = self.store.lock().await;
@@ -465,6 +730,27 @@ impl Firestore for FirestoreService {
             .document
             .ok_or_else(|| Status::invalid_argument("document is required"))?;
         let name = document.name.clone();
+        if self.persistence.is_some() {
+            let (results, _, documents) = self
+                .persistent_writes(
+                    database_from_resource(&name)?,
+                    vec![Write {
+                        operation: Some(write::Operation::Update(document)),
+                        update_mask: request.update_mask,
+                        current_document: request.current_document,
+                        update_transforms: vec![],
+                    }],
+                    false,
+                    timestamp_now(),
+                )
+                .await?;
+            let _ = results;
+            return documents
+                .get(&name)
+                .cloned()
+                .map(Response::new)
+                .ok_or_else(|| Status::internal("updated document disappeared"));
+        }
         let mut store = self.store.lock().await;
         let before = store.documents.get(&name).cloned();
         apply_write(
@@ -489,6 +775,21 @@ impl Firestore for FirestoreService {
     ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
         validate_document_name(&request.name)?;
+        if self.persistence.is_some() {
+            self.persistent_writes(
+                database_from_resource(&request.name)?,
+                vec![Write {
+                    operation: Some(write::Operation::Delete(request.name)),
+                    update_mask: None,
+                    current_document: request.current_document,
+                    update_transforms: vec![],
+                }],
+                false,
+                timestamp_now(),
+            )
+            .await?;
+            return Ok(Response::new(()));
+        }
         let mut store = self.store.lock().await;
         check_precondition(
             store.documents.get(&request.name),
@@ -524,12 +825,24 @@ impl Firestore for FirestoreService {
             }
             _ => None,
         };
+        let persistent_documents = if self.persistence.is_some() {
+            Some(
+                self.documents(&request.documents)
+                    .await?
+                    .into_iter()
+                    .map(|document| (document.name.clone(), document))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        } else {
+            None
+        };
         let mut responses: Vec<_> = request
             .documents
             .into_iter()
             .map(|name| {
-                let result = store
-                    .documents
+                let result = persistent_documents
+                    .as_ref()
+                    .unwrap_or(&store.documents)
                     .get(&name)
                     .cloned()
                     .map(batch_get_documents_response::Result::Found)
@@ -576,6 +889,18 @@ impl Firestore for FirestoreService {
         if !request.transaction.is_empty() {
             validate_transaction(&store, &request.database, &request.transaction)?;
         }
+        if self.persistence.is_some() {
+            let (results, _, _) = self
+                .persistent_writes(request.database, request.writes, false, commit_time)
+                .await?;
+            if !request.transaction.is_empty() {
+                store.transactions.remove(&request.transaction);
+            }
+            return Ok(Response::new(CommitResponse {
+                write_results: results,
+                commit_time: Some(commit_time),
+            }));
+        }
         let mut pending = store.documents.clone();
         let mut results = Vec::with_capacity(request.writes.len());
         for write in request.writes {
@@ -607,6 +932,15 @@ impl Firestore for FirestoreService {
     ) -> Result<Response<BatchWriteResponse>, Status> {
         let request = request.into_inner();
         let write_time = timestamp_now();
+        if self.persistence.is_some() {
+            let (write_results, status, _) = self
+                .persistent_writes(request.database, request.writes, true, write_time)
+                .await?;
+            return Ok(Response::new(BatchWriteResponse {
+                write_results,
+                status,
+            }));
+        }
         let mut store = self.store.lock().await;
         let before = store.documents.clone();
         let mut write_results = Vec::with_capacity(request.writes.len());
@@ -718,6 +1052,27 @@ impl FirestoreService {
     async fn clear_database(&self, database: &str) -> Result<(), Status> {
         let prefix = database_document_prefix(database)?;
         let mut store = self.store.lock().await;
+        if let Some(persistence) = &self.persistence {
+            let database = database.to_owned();
+            let durable_database = database.clone();
+            persistence
+                .write(move |connection| {
+                    let transaction = connection.transaction()?;
+                    transaction.execute(
+                        "DELETE FROM firestore_documents WHERE database_name=?1",
+                        params![durable_database],
+                    )?;
+                    transaction.commit()?;
+                    Ok(())
+                })
+                .await
+                .map_err(persistence_status)?;
+            store
+                .transactions
+                .retain(|_, transaction_database| transaction_database != &database);
+            let _ = self.changes.send(());
+            return Ok(());
+        }
         store.documents.retain(|name, _| !name.starts_with(&prefix));
         store
             .transactions
@@ -729,8 +1084,9 @@ impl FirestoreService {
 
 pub async fn serve(
     addr: std::net::SocketAddr,
+    persistence: Option<crate::persistence::Persistence>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = FirestoreService::default();
+    let service = FirestoreService::new(persistence);
     let http_clear_service = service.clone();
     let grpc_routes = tonic::service::Routes::new(FirestoreServer::new(service.clone()))
         .add_service(FirestoreEmulatorServer::new(service.clone()))
@@ -744,8 +1100,10 @@ pub async fn serve(
                 async move {
                     // The route captures valid nonempty resource segments.
                     let resource = format!("projects/{project}/databases/{database}");
-                    let _ = service.clear_database(&resource).await;
-                    StatusCode::OK
+                    match service.clear_database(&resource).await {
+                        Ok(()) => StatusCode::OK,
+                        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    }
                 }
             }),
         );
@@ -1152,6 +1510,156 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejected.code(), tonic::Code::Unimplemented);
     }
+
+    #[tokio::test]
+    async fn persistent_documents_and_auto_ids_survive_reopen_without_hydration() {
+        let root = std::env::temp_dir().join(format!(
+            "firebase-emu-firestore-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persistence = crate::persistence::Persistence::open(root.clone(), false)
+            .await
+            .unwrap();
+        let service = FirestoreService::new(Some(persistence.clone()));
+        let mut value = document("", i64::MAX);
+        value.fields.insert(
+            "bytes".into(),
+            Value {
+                value_type: Some(google::firestore::v1::value::ValueType::BytesValue(vec![
+                    0, 255, 7,
+                ])),
+            },
+        );
+        let first = service
+            .create_document(Request::new(CreateDocumentRequest {
+                parent: ROOT.to_owned(),
+                collection_id: "typed".to_owned(),
+                document_id: String::new(),
+                document: Some(value.clone()),
+                mask: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(service.store.lock().await.documents.is_empty());
+        drop(service);
+        drop(persistence);
+
+        let persistence = crate::persistence::Persistence::open(root.clone(), false)
+            .await
+            .unwrap();
+        let service = FirestoreService::new(Some(persistence.clone()));
+        let fetched = service
+            .get_document(Request::new(GetDocumentRequest {
+                name: first.name.clone(),
+                mask: None,
+                consistency_selector: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fetched.fields, first.fields);
+        let second = service
+            .create_document(Request::new(CreateDocumentRequest {
+                parent: ROOT.to_owned(),
+                collection_id: "typed".to_owned(),
+                document_id: String::new(),
+                document: Some(value),
+                mask: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_ne!(first.name, second.name);
+        let queried = service
+            .query_docs(
+                ROOT,
+                &StructuredQuery {
+                    from: vec![structured_query::CollectionSelector {
+                        collection_id: "typed".to_owned(),
+                        all_descendants: false,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(queried.len(), 2);
+        drop(service);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_commit_failure_is_atomic_and_clear_is_database_scoped() {
+        let root = std::env::temp_dir().join(format!(
+            "firebase-emu-firestore-atomic-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let persistence = crate::persistence::Persistence::open(root.clone(), true)
+            .await
+            .unwrap();
+        let service = FirestoreService::new(Some(persistence.clone()));
+        let mut changes = service.subscribe();
+        let default_name = format!("{ROOT}/items/default");
+        let other_name = "projects/test/databases/other/documents/items/other".to_owned();
+        let result = service
+            .commit(Request::new(CommitRequest {
+                database: "projects/test/databases/(default)".to_owned(),
+                writes: vec![
+                    Write {
+                        operation: Some(write::Operation::Update(document(&default_name, 1))),
+                        ..Default::default()
+                    },
+                    Write {
+                        operation: Some(write::Operation::Update(document(&other_name, 2))),
+                        ..Default::default()
+                    },
+                ],
+                transaction: Vec::new(),
+            }))
+            .await;
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        assert!(service.document(&default_name).await.unwrap().is_none());
+        assert!(changes.try_recv().is_err());
+        let outbox_count = persistence
+            .read(|connection| {
+                Ok(
+                    connection.query_row("SELECT count(*) FROM event_outbox", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+
+        for (database, name) in [
+            ("projects/test/databases/(default)", default_name.clone()),
+            ("projects/test/databases/other", other_name.clone()),
+        ] {
+            service
+                .commit(Request::new(CommitRequest {
+                    database: database.to_owned(),
+                    writes: vec![Write {
+                        operation: Some(write::Operation::Update(document(&name, 1))),
+                        ..Default::default()
+                    }],
+                    transaction: Vec::new(),
+                }))
+                .await
+                .unwrap();
+        }
+        service
+            .clear_database("projects/test/databases/(default)")
+            .await
+            .unwrap();
+        assert!(service.document(&default_name).await.unwrap().is_none());
+        assert!(service.document(&other_name).await.unwrap().is_some());
+        drop(service);
+        drop(persistence);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn field_path(path: &str) -> Result<Vec<String>, Status> {
@@ -1458,9 +1966,21 @@ impl FirestoreService {
             return Err(Status::invalid_argument("negative query bounds"));
         }
         let selector = &query.from[0];
+        let database = database_from_resource(parent)?;
+        let persistent_documents = if self.persistence.is_some() {
+            Some(self.database_documents(&database).await?)
+        } else {
+            None
+        };
         let store = self.store.lock().await;
         let mut docs = Vec::new();
-        for doc in store.documents.values() {
+        let documents: Box<dyn Iterator<Item = &Document> + '_> =
+            if let Some(documents) = persistent_documents.as_ref() {
+                Box::new(documents.iter())
+            } else {
+                Box::new(store.documents.values())
+            };
+        for doc in documents {
             if matches_collection(
                 &doc.name,
                 parent,
@@ -1567,13 +2087,7 @@ impl FirestoreService {
     }
     async fn target_docs(&self, target: &Target) -> Result<Vec<Document>, Status> {
         match target.target_type.as_ref() {
-            Some(target::TargetType::Documents(d)) => {
-                let store = self.store.lock().await;
-                Ok(d.documents
-                    .iter()
-                    .filter_map(|n| store.documents.get(n).cloned())
-                    .collect())
-            }
+            Some(target::TargetType::Documents(d)) => self.documents(&d.documents).await,
             Some(target::TargetType::Query(q)) => match &q.query_type {
                 Some(target::query_target::QueryType::StructuredQuery(query)) => {
                     self.query_docs(&q.parent, query).await

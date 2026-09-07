@@ -9,7 +9,7 @@ exports.echo=functions.https.onCall(async(data,context)=>({data,uid:context.auth
 exports.fail=functions.https.onCall(()=>{throw new functions.https.HttpsError('invalid-argument','Fixture error',{reason:'test'});});
 exports.reject=functions.https.onCall(async()=>{throw Error('private failure');});
 exports.http=functions.https.onRequest(async(req,res)=>{await new Promise(r=>setTimeout(r,5));res.status(201).set('x-fixture','yes').json({method:req.method,path:req.path,query:req.query,body:req.body,raw:req.rawBody?.toString()});});
-exports.write=functions.firestore.document('items/{itemId}').onWrite((change,ctx)=>record('write',{before:change.before.exists?change.before.data():null,after:change.after.exists?change.after.data():null,id:change.after.exists?change.after.id:change.before.id,param:ctx.params.itemId}));
+exports.write=functions.firestore.document('items/{itemId}').onWrite((change,ctx)=>record('write',{before:change.before.exists?change.before.data():null,after:change.after.exists?change.after.data():null,id:change.after.exists?change.after.id:change.before.id,param:ctx.params.itemId,eventId:ctx.eventId}));
 exports.create=functions.firestore.document('items/{itemId}').onCreate((snap,ctx)=>record('create',{data:snap.data(),param:ctx.params.itemId,exists:snap.exists}));
 exports.remove=functions.firestore.document('items/{itemId}').onDelete((snap,ctx)=>record('remove',{data:snap.data(),param:ctx.params.itemId,exists:snap.exists}));
 exports.update=functions.firestore.document('items/{itemId}').onUpdate((change,ctx)=>record('update',{before:change.before.data(),after:change.after.data(),param:ctx.params.itemId}));

@@ -3,6 +3,7 @@ mod firestore;
 mod firestore_web;
 mod functions;
 mod functions_config;
+mod persistence;
 mod storage;
 
 use std::{
@@ -37,6 +38,8 @@ async fn serve_http(addr: SocketAddr, router: axum::Router) -> Result<(), BoxErr
 #[derive(Default)]
 struct CommandLine {
     config_root: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    in_memory: bool,
     no_functions: bool,
     functions: functions_config::ConfigOverrides,
 }
@@ -62,6 +65,10 @@ fn command_line() -> Result<CommandLine, BoxError> {
             "--config" => {
                 result.config_root = Some(PathBuf::from(option_value(&mut args, "--config")?))
             }
+            "--data-dir" => {
+                result.data_dir = Some(PathBuf::from(option_value(&mut args, "--data-dir")?))
+            }
+            "--in-memory" => result.in_memory = true,
             "--project" => result.functions.project = Some(option_value(&mut args, "--project")?),
             "--host" => result.functions.host = Some(option_value(&mut args, "--host")?),
             "--functions-port" => {
@@ -91,13 +98,21 @@ fn command_line() -> Result<CommandLine, BoxError> {
             }
             "--no-functions" => result.no_functions = true,
             "--help" | "-h" => {
-                println!("firebase-emu [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions]");
+                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions]");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option `{argument}` (use --help)").into()),
         }
     }
+    validate_command_line(&result)?;
     Ok(result)
+}
+
+fn validate_command_line(result: &CommandLine) -> Result<(), BoxError> {
+    if result.data_dir.is_some() && result.in_memory {
+        return Err("--data-dir and --in-memory cannot be used together".into());
+    }
+    Ok(())
 }
 
 fn environment_snapshot() -> BTreeMap<String, String> {
@@ -131,7 +146,14 @@ fn configured_root(cli: &CommandLine) -> Result<Option<PathBuf>, BoxError> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), BoxError> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("firebase-emu: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), BoxError> {
     let cli = command_line()?;
     let functions_config = if cli.no_functions {
         None
@@ -161,7 +183,29 @@ async fn main() -> Result<(), BoxError> {
         .as_ref()
         .map(|config| config.project_id.as_str())
         .or(cli.functions.project.as_deref());
-    let auth_router = auth::router_for_project(auth_project);
+    let persistence = match cli.data_dir.clone() {
+        Some(path) => {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()?.join(path)
+            };
+            let persistence =
+                persistence::Persistence::open(path, functions_config.is_some()).await?;
+            eprintln!(
+                "Persistence: SQLite WAL at {} (objects: {})",
+                persistence.database_path().display(),
+                persistence.blobs_dir().display()
+            );
+            Some(persistence)
+        }
+        None => {
+            eprintln!("Persistence: in-memory (data is discarded on exit)");
+            None
+        }
+    };
+    let auth_router = auth::router_for_project(auth_project, persistence.clone());
+    let storage_router = storage::router(persistence.clone()).await?;
 
     eprintln!("Firestore emulator listening on {firestore_addr}");
     eprintln!("Auth emulator listening on {auth_addr}");
@@ -171,16 +215,16 @@ async fn main() -> Result<(), BoxError> {
         // Every service is long-lived. A clean Functions shutdown or any service
         // failure ends the process and drops the remaining listener futures.
         tokio::select! {
-            result = firestore::serve(firestore_addr) => result,
+            result = firestore::serve(firestore_addr, persistence.clone()) => result,
             result = serve_http(auth_addr, auth_router) => result,
-            result = serve_http(storage_addr, storage::router()) => result,
-            result = functions::serve(config) => result,
+            result = serve_http(storage_addr, storage_router) => result,
+            result = functions::serve(config, persistence.clone()) => result,
         }
     } else {
         tokio::try_join!(
-            firestore::serve(firestore_addr),
+            firestore::serve(firestore_addr, persistence.clone()),
             serve_http(auth_addr, auth_router),
-            serve_http(storage_addr, storage::router()),
+            serve_http(storage_addr, storage_router),
         )?;
         Ok(())
     }
@@ -199,5 +243,18 @@ mod tests {
             address("FIRESTORE_EMU_PORT", 8080).unwrap(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
         );
+    }
+
+    #[test]
+    fn persistence_flags_are_mutually_exclusive() {
+        let command = CommandLine {
+            data_dir: Some(PathBuf::from("state")),
+            in_memory: true,
+            ..CommandLine::default()
+        };
+        assert!(validate_command_line(&command)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be used together"));
     }
 }

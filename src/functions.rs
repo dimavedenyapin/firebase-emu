@@ -2,6 +2,7 @@
 use crate::{
     firestore::google::firestore::v1::Document,
     functions_config::{FunctionCodebase, FunctionsConfig},
+    persistence::{OutboxRecord, Persistence},
     BoxError,
 };
 use axum::{
@@ -13,7 +14,9 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::Deserialize;
+use prost::Message;
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     borrow::Cow,
@@ -36,7 +39,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
 struct Hub {
-    tx: mpsc::Sender<QueuedEvent>,
+    tx: mpsc::Sender<QueueMessage>,
+    persistence: Option<Persistence>,
     pending: AtomicUsize,
     sequence: AtomicU64,
     failures: Mutex<Vec<Value>>,
@@ -46,6 +50,10 @@ struct Hub {
 struct QueuedEvent {
     source: EventSource,
     id: u64,
+}
+enum QueueMessage {
+    Direct(Box<QueuedEvent>),
+    DurableWake,
 }
 #[derive(Clone)]
 enum EventSource {
@@ -72,7 +80,10 @@ fn enqueue(source: EventSource) -> Result<u64, String> {
     };
     let id = hub.sequence.fetch_add(1, Ordering::SeqCst) + 1;
     hub.pending.fetch_add(1, Ordering::SeqCst);
-    if let Err(error) = hub.tx.try_send(QueuedEvent { source, id }) {
+    if let Err(error) = hub
+        .tx
+        .try_send(QueueMessage::Direct(Box::new(QueuedEvent { source, id })))
+    {
         hub.pending.fetch_sub(1, Ordering::SeqCst);
         let message = format!("trigger queue rejected event: {error}");
         hub.failures
@@ -82,6 +93,68 @@ fn enqueue(source: EventSource) -> Result<u64, String> {
         return Err(message);
     }
     Ok(id)
+}
+
+#[derive(Serialize, Deserialize)]
+struct FirestoreOutboxPayload {
+    before: Option<String>,
+    after: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StorageOutboxPayload {
+    kind: String,
+    object: Value,
+}
+
+pub(crate) fn document_outbox_record(
+    before: Option<&Document>,
+    after: Option<&Document>,
+) -> Vec<OutboxRecord> {
+    if before.map(|document| &document.fields) == after.map(|document| &document.fields) {
+        return Vec::new();
+    }
+    let payload = FirestoreOutboxPayload {
+        before: before.map(|document| BASE64.encode(document.encode_to_vec())),
+        after: after.map(|document| BASE64.encode(document.encode_to_vec())),
+    };
+    vec![OutboxRecord {
+        source: "firestore".into(),
+        payload: serde_json::to_vec(&payload).expect("Firestore event payload is serializable"),
+    }]
+}
+
+pub(crate) fn document_outbox_records(
+    before: &BTreeMap<String, Document>,
+    after: &BTreeMap<String, Document>,
+) -> Vec<OutboxRecord> {
+    let mut records = Vec::new();
+    for (name, old) in before {
+        records.extend(document_outbox_record(Some(old), after.get(name)));
+    }
+    for (name, new) in after {
+        if !before.contains_key(name) {
+            records.extend(document_outbox_record(None, Some(new)));
+        }
+    }
+    records
+}
+
+pub(crate) fn storage_outbox_record(kind: &str, object: Value) -> OutboxRecord {
+    OutboxRecord {
+        source: "storage".into(),
+        payload: serde_json::to_vec(&StorageOutboxPayload {
+            kind: kind.into(),
+            object,
+        })
+        .expect("Storage event payload is serializable"),
+    }
+}
+
+pub(crate) fn outbox_committed() {
+    if let Some(hub) = HUB.get() {
+        let _ = hub.tx.try_send(QueueMessage::DurableWake);
+    }
 }
 
 /// Called only after a successful mutation, while the Firestore store is locked.
@@ -172,8 +245,46 @@ fn event_kind(before: bool, after: bool) -> &'static str {
     }
 }
 impl Runtime {
-    fn status(&self) -> Value {
-        json!({"pending":self.hub.pending.load(Ordering::SeqCst),"completed":self.hub.completed.load(Ordering::SeqCst),"failures":*self.hub.failures.lock().unwrap()})
+    async fn status(&self) -> Value {
+        let volatile_pending = self.hub.pending.load(Ordering::SeqCst) as i64;
+        let volatile_completed = self.hub.completed.load(Ordering::SeqCst) as i64;
+        let mut failures = self.hub.failures.lock().unwrap().clone();
+        let Some(persistence) = &self.hub.persistence else {
+            return json!({"pending":volatile_pending,"completed":volatile_completed,"failures":failures});
+        };
+        match persistence
+            .read(|connection| {
+                let pending: i64 = connection.query_row(
+                    "SELECT count(*) FROM event_outbox WHERE state IN ('pending','in_flight')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let completed: i64 = connection.query_row(
+                    "SELECT value FROM counters WHERE name='event_completed'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let mut statement = connection.prepare(
+                    "SELECT id, last_error FROM event_outbox WHERE state='failed' ORDER BY id LIMIT 1000",
+                )?;
+                let durable_failures = statement
+                    .query_map([], |row| {
+                        Ok(json!({"eventId":row.get::<_,i64>(0)?,"error":row.get::<_,Option<String>>(1)?.unwrap_or_else(||"delivery failed".into())}))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((pending, completed, durable_failures))
+            })
+            .await
+        {
+            Ok((pending, completed, durable_failures)) => {
+                failures.extend(durable_failures);
+                json!({"pending":pending + volatile_pending,"completed":completed + volatile_completed,"failures":failures})
+            }
+            Err(error) => {
+                failures.push(json!({"eventId":null,"error":error.to_string()}));
+                json!({"pending":volatile_pending,"completed":volatile_completed,"failures":failures})
+            }
+        }
     }
     async fn post_event(
         &self,
@@ -370,9 +481,241 @@ fn chrono_timestamp() -> String {
     let second = day_seconds % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
 }
-async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueuedEvent>) {
+
+#[derive(Clone)]
+struct DurableRow {
+    id: i64,
+    source: String,
+    payload: Vec<u8>,
+    attempts: i64,
+}
+
+fn decode_durable(row: &DurableRow) -> Result<QueuedEvent, String> {
+    let source = match row.source.as_str() {
+        "firestore" => {
+            let payload: FirestoreOutboxPayload =
+                serde_json::from_slice(&row.payload).map_err(|error| error.to_string())?;
+            let decode = |value: Option<String>| -> Result<Option<Document>, String> {
+                value
+                    .map(|value| {
+                        BASE64
+                            .decode(value)
+                            .map_err(|error| error.to_string())
+                            .and_then(|bytes| {
+                                Document::decode(bytes.as_slice())
+                                    .map_err(|error| error.to_string())
+                            })
+                    })
+                    .transpose()
+            };
+            EventSource::Firestore {
+                before: decode(payload.before)?,
+                after: decode(payload.after)?,
+            }
+        }
+        "storage" => {
+            let payload: StorageOutboxPayload =
+                serde_json::from_slice(&row.payload).map_err(|error| error.to_string())?;
+            let kind = match payload.kind.as_str() {
+                "finalize" => "finalize",
+                "delete" => "delete",
+                other => return Err(format!("unsupported durable Storage event kind: {other}")),
+            };
+            EventSource::Storage {
+                kind,
+                object: payload.object,
+            }
+        }
+        other => return Err(format!("unsupported durable event source: {other}")),
+    };
+    Ok(QueuedEvent {
+        source,
+        id: row.id as u64,
+    })
+}
+
+async fn recover_outbox(persistence: &Persistence) -> Result<(), String> {
+    persistence
+        .write(|connection| {
+            connection.execute(
+                "UPDATE event_outbox SET state='pending', lease_until=NULL \
+                 WHERE state='in_flight'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn claim_outbox(persistence: &Persistence) -> Result<Option<DurableRow>, String> {
+    persistence
+        .write(|connection| {
+            let transaction = connection.transaction()?;
+            let now = unix_now_i64();
+            let row = {
+                let mut statement = transaction.prepare(
+                    "SELECT id, source, payload, attempts FROM event_outbox \
+                     WHERE state='pending' AND available_at <= ?1 ORDER BY id LIMIT 1",
+                )?;
+                statement
+                    .query_row([now], |row| {
+                        Ok(DurableRow {
+                            id: row.get(0)?,
+                            source: row.get(1)?,
+                            payload: row.get(2)?,
+                            attempts: row.get(3)?,
+                        })
+                    })
+                    .optional()?
+            };
+            if let Some(row) = &row {
+                transaction.execute(
+                    "UPDATE event_outbox SET state='in_flight', attempts=attempts+1, \
+                     lease_until=?2 WHERE id=?1",
+                    rusqlite::params![row.id, now + 60],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(row.map(|mut row| {
+                row.attempts += 1;
+                row
+            }))
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn acknowledge_outbox(persistence: &Persistence, id: i64) -> Result<(), String> {
+    persistence
+        .write(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE event_outbox SET state='delivered', delivered_at=unixepoch(), \
+                 lease_until=NULL, last_error=NULL WHERE id=?1 AND state='in_flight'",
+                [id],
+            )?;
+            transaction.execute(
+                "UPDATE counters SET value=value+1 WHERE name='event_completed'",
+                [],
+            )?;
+            transaction.execute(
+                "DELETE FROM event_outbox WHERE state='delivered' AND id NOT IN \
+                 (SELECT id FROM event_outbox WHERE state='delivered' ORDER BY id DESC LIMIT 1000)",
+                [],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn fail_outbox(
+    persistence: &Persistence,
+    row: &DurableRow,
+    message: String,
+) -> Result<(), String> {
+    let id = row.id;
+    let attempts = row.attempts;
+    persistence
+        .write(move |connection| {
+            if attempts >= 5 {
+                connection.execute(
+                    "UPDATE event_outbox SET state='failed', lease_until=NULL, last_error=?2 \
+                     WHERE id=?1",
+                    rusqlite::params![id, message],
+                )?;
+                connection.execute(
+                    "DELETE FROM event_outbox WHERE state='failed' AND id NOT IN \
+                     (SELECT id FROM event_outbox WHERE state='failed' ORDER BY id DESC LIMIT 1000)",
+                    [],
+                )?;
+            } else {
+                let delay = 1_i64 << (attempts - 1).clamp(0, 4);
+                connection.execute(
+                    "UPDATE event_outbox SET state='pending', lease_until=NULL, last_error=?2, \
+                     available_at=unixepoch()+?3 WHERE id=?1",
+                    rusqlite::params![id, message, delay],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn unix_now_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueueMessage>) {
+    if let Some(persistence) = &runtime.hub.persistence {
+        if let Err(error) = recover_outbox(persistence).await {
+            runtime
+                .hub
+                .failures
+                .lock()
+                .unwrap()
+                .push(json!({"eventId":null,"error":error}));
+        }
+    }
     let mut busy_count = 0;
-    while let Some(event) = rx.recv().await {
+    loop {
+        if let Some(persistence) = &runtime.hub.persistence {
+            match claim_outbox(persistence).await {
+                Ok(Some(row)) => {
+                    let result = match decode_durable(&row) {
+                        Ok(event) => runtime.dispatch(&event).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        if let Err(persistence_error) =
+                            fail_outbox(persistence, &row, error.clone()).await
+                        {
+                            runtime.hub.failures.lock().unwrap().push(json!({
+                                "eventId": row.id,
+                                "error": persistence_error
+                            }));
+                        }
+                    } else {
+                        if let Some(delay) = std::env::var("FIREBASE_EMU_TEST_OUTBOX_ACK_DELAY_MS")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay.min(60_000))).await;
+                        }
+                        if let Err(error) = acknowledge_outbox(persistence, row.id).await {
+                            runtime
+                                .hub
+                                .failures
+                                .lock()
+                                .unwrap()
+                                .push(json!({"eventId":row.id,"error":error}));
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => runtime
+                    .hub
+                    .failures
+                    .lock()
+                    .unwrap()
+                    .push(json!({"eventId":null,"error":error})),
+            }
+        }
+        let message = tokio::select! {
+            message=rx.recv()=>message,
+            _=tokio::time::sleep(Duration::from_millis(250))=>Some(QueueMessage::DurableWake),
+        };
+        let Some(message) = message else { break };
+        let QueueMessage::Direct(event) = message else {
+            continue;
+        };
         busy_count += 1;
         let result = if busy_count > 1000 {
             Err("trigger loop limit exceeded (1000 events without an idle queue)".into())
@@ -394,23 +737,30 @@ async fn run_queue(runtime: Runtime, mut rx: mpsc::Receiver<QueuedEvent>) {
     }
 }
 async fn status(State(runtime): State<Runtime>) -> Json<Value> {
-    Json(runtime.status())
+    Json(runtime.status().await)
 }
 async fn drain(State(runtime): State<Runtime>) -> Response {
     let result = timeout(Duration::from_secs(30), async {
-        while runtime.hub.pending.load(Ordering::SeqCst) > 0 {
+        loop {
+            let status = runtime.status().await;
+            if status["pending"].as_i64().unwrap_or(0) == 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
     let code = if result.is_err() {
         StatusCode::REQUEST_TIMEOUT
-    } else if runtime.hub.failures.lock().unwrap().is_empty() {
+    } else if runtime.status().await["failures"]
+        .as_array()
+        .is_some_and(Vec::is_empty)
+    {
         StatusCode::OK
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    (code, Json(runtime.status())).into_response()
+    (code, Json(runtime.status().await)).into_response()
 }
 async fn inject_pubsub(
     State(runtime): State<Runtime>,
@@ -762,7 +1112,10 @@ async fn stop_children(children: &mut [ManagedChild]) {
 }
 
 /// Rust owns the public endpoint and one private Node child per configured codebase.
-pub(crate) async fn serve(config: FunctionsConfig) -> Result<(), BoxError> {
+pub(crate) async fn serve(
+    config: FunctionsConfig,
+    persistence: Option<Persistence>,
+) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(config.addresses.functions).await?;
     let mut workers = Vec::with_capacity(config.codebases.len());
     let mut children = Vec::with_capacity(config.codebases.len());
@@ -791,6 +1144,7 @@ pub(crate) async fn serve(config: FunctionsConfig) -> Result<(), BoxError> {
     let (tx, rx) = mpsc::channel(4096);
     let hub = Arc::new(Hub {
         tx,
+        persistence,
         pending: AtomicUsize::new(0),
         sequence: AtomicU64::new(0),
         failures: Mutex::new(vec![]),
@@ -837,6 +1191,7 @@ mod tests {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             hub: Arc::new(Hub {
                 tx,
+                persistence: None,
                 pending: AtomicUsize::new(0),
                 sequence: AtomicU64::new(0),
                 failures: Mutex::new(vec![]),

@@ -1,0 +1,405 @@
+use fs2::FileExt;
+use rusqlite::{Connection, OpenFlags, Transaction};
+use std::{
+    any::Any,
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+
+pub(crate) const SCHEMA_VERSION: i64 = 1;
+const APPLICATION_ID: i64 = 0x4645_4d55; // "FEMU"
+const WRITER_QUEUE_CAPACITY: usize = 128;
+const MAX_READERS: usize = 8;
+
+type DynamicResult = Result<Box<dyn Any + Send>, Error>;
+type Job = Box<dyn FnOnce(&mut Connection) -> DynamicResult + Send>;
+
+struct WriteRequest {
+    job: Job,
+    response: oneshot::Sender<DynamicResult>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error("persistence I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("SQLite persistence error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("data directory is already owned by another firebase-emu process: {0}")]
+    AlreadyOwned(PathBuf),
+    #[error(
+        "unsupported persistence schema version {found}; this binary supports up to {supported}"
+    )]
+    NewerSchema { found: i64, supported: i64 },
+    #[error("persistence database failed integrity_check: {0}")]
+    Corrupt(String),
+    #[error("refusing to initialize a non-empty SQLite database without a firebase-emu schema")]
+    ForeignDatabase,
+    #[error("persistence writer stopped unexpectedly")]
+    WriterStopped,
+    #[error("persistence worker returned an unexpected result type")]
+    ResultType,
+    #[error("persistence blocking task failed: {0}")]
+    Join(String),
+    #[error("durable Functions outbox is full ({0} pending or in-flight events)")]
+    OutboxFull(i64),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OutboxRecord {
+    pub source: String,
+    pub payload: Vec<u8>,
+}
+
+struct Inner {
+    root: PathBuf,
+    database: PathBuf,
+    blobs: PathBuf,
+    temporary: PathBuf,
+    writer: mpsc::Sender<WriteRequest>,
+    readers: Semaphore,
+    events_enabled: bool,
+    _owner_lock: File,
+}
+
+#[derive(Clone)]
+pub(crate) struct Persistence(Arc<Inner>);
+
+impl std::fmt::Debug for Persistence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Persistence")
+            .field("root", &self.0.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Persistence {
+    pub(crate) async fn open(path: PathBuf, events_enabled: bool) -> Result<Self, Error> {
+        tokio::task::spawn_blocking(move || Self::open_blocking(&path, events_enabled))
+            .await
+            .map_err(|error| Error::Join(error.to_string()))?
+    }
+
+    fn open_blocking(path: &Path, events_enabled: bool) -> Result<Self, Error> {
+        fs::create_dir_all(path)?;
+        let root = fs::canonicalize(path)?;
+        let lock_path = root.join(".firebase-emu.lock");
+        let owner_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        owner_lock
+            .try_lock_exclusive()
+            .map_err(|_| Error::AlreadyOwned(root.clone()))?;
+
+        let blobs = root.join("blobs");
+        let temporary = root.join("tmp");
+        fs::create_dir_all(&blobs)?;
+        fs::create_dir_all(&temporary)?;
+        let database = root.join("firebase-emu.sqlite3");
+        let mut connection = open_connection(&database)?;
+        migrate(&mut connection)?;
+
+        let (writer, mut receiver) = mpsc::channel::<WriteRequest>(WRITER_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("firebase-emu-sqlite-writer".into())
+            .spawn(move || {
+                let mut connection = connection;
+                while let Some(request) = receiver.blocking_recv() {
+                    let result = (request.job)(&mut connection);
+                    let _ = request.response.send(result);
+                }
+            })?;
+
+        Ok(Self(Arc::new(Inner {
+            root,
+            database,
+            blobs,
+            temporary,
+            writer,
+            readers: Semaphore::new(MAX_READERS),
+            events_enabled,
+            _owner_lock: owner_lock,
+        })))
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.0.database
+    }
+
+    pub(crate) fn blobs_dir(&self) -> &Path {
+        &self.0.blobs
+    }
+
+    pub(crate) fn temporary_dir(&self) -> &Path {
+        &self.0.temporary
+    }
+
+    pub(crate) fn events_enabled(&self) -> bool {
+        self.0.events_enabled
+    }
+
+    pub(crate) async fn write<R, F>(&self, operation: F) -> Result<R, Error>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<R, Error> + Send + 'static,
+    {
+        let (response, result) = oneshot::channel();
+        let job = Box::new(move |connection: &mut Connection| {
+            operation(connection).map(|value| Box::new(value) as Box<dyn Any + Send>)
+        });
+        self.0
+            .writer
+            .send(WriteRequest { job, response })
+            .await
+            .map_err(|_| Error::WriterStopped)?;
+        result
+            .await
+            .map_err(|_| Error::WriterStopped)??
+            .downcast::<R>()
+            .map(|value| *value)
+            .map_err(|_| Error::ResultType)
+    }
+
+    pub(crate) async fn read<R, F>(&self, operation: F) -> Result<R, Error>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, Error> + Send + 'static,
+    {
+        let permit = self
+            .0
+            .readers
+            .acquire()
+            .await
+            .map_err(|_| Error::WriterStopped)?;
+        let database = self.0.database.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let connection = open_read_connection(&database)?;
+            operation(&connection)
+        })
+        .await
+        .map_err(|error| Error::Join(error.to_string()))?;
+        drop(permit);
+        result
+    }
+
+    pub(crate) fn insert_outbox(
+        &self,
+        transaction: &Transaction<'_>,
+        records: &[OutboxRecord],
+    ) -> Result<Vec<i64>, Error> {
+        if !self.events_enabled() {
+            return Ok(Vec::new());
+        }
+        let outstanding: i64 = transaction.query_row(
+            "SELECT count(*) FROM event_outbox WHERE state IN ('pending','in_flight')",
+            [],
+            |row| row.get(0),
+        )?;
+        if outstanding.saturating_add(records.len() as i64) > 4096 {
+            return Err(Error::OutboxFull(outstanding));
+        }
+        let mut ids = Vec::with_capacity(records.len());
+        for record in records {
+            transaction.execute(
+                "INSERT INTO event_outbox(source, payload, state, attempts, available_at) \
+                 VALUES (?1, ?2, 'pending', 0, 0)",
+                rusqlite::params![record.source, record.payload],
+            )?;
+            ids.push(transaction.last_insert_rowid());
+        }
+        Ok(ids)
+    }
+}
+
+fn configure(connection: &Connection) -> Result<(), Error> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys=ON;\
+         PRAGMA synchronous=FULL;\
+         PRAGMA wal_autocheckpoint=1000;\
+         PRAGMA cache_size=-8192;",
+    )?;
+    Ok(())
+}
+
+fn open_connection(path: &Path) -> Result<Connection, Error> {
+    let connection = Connection::open(path)?;
+    configure(&connection)?;
+    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::Corrupt(format!(
+            "could not enable WAL mode (SQLite returned {mode})"
+        )));
+    }
+    Ok(connection)
+}
+
+fn open_read_connection(path: &Path) -> Result<Connection, Error> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-8192;")?;
+    Ok(connection)
+}
+
+fn migrate(connection: &mut Connection) -> Result<(), Error> {
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(Error::Corrupt(integrity));
+    }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(Error::NewerSchema {
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if version == 0 {
+        let application_id: i64 =
+            connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        let table_count: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_count != 0 || (application_id != 0 && application_id != APPLICATION_ID) {
+            return Err(Error::ForeignDatabase);
+        }
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE firestore_documents(\
+                 name TEXT PRIMARY KEY NOT NULL,\
+                 database_name TEXT NOT NULL,\
+                 document BLOB NOT NULL\
+             );\
+             CREATE INDEX firestore_documents_database ON firestore_documents(database_name, name);\
+             CREATE TABLE counters(name TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL);\
+             INSERT INTO counters(name, value) VALUES \
+                 ('firestore_auto_id', 0), ('storage_generation', 0), ('event_completed', 0);\
+             CREATE TABLE auth_users(\
+                 namespace TEXT NOT NULL, uid TEXT NOT NULL, user_json TEXT NOT NULL,\
+                 password TEXT, PRIMARY KEY(namespace, uid)\
+             );\
+             CREATE INDEX auth_users_email ON auth_users(namespace, json_extract(user_json, '$.email'));\
+             CREATE TABLE auth_sessions(\
+                 token TEXT PRIMARY KEY NOT NULL, namespace TEXT NOT NULL, uid TEXT NOT NULL,\
+                 issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, kind INTEGER NOT NULL\
+             );\
+             CREATE INDEX auth_sessions_user ON auth_sessions(namespace, uid);\
+             CREATE TABLE storage_objects(\
+                 bucket TEXT NOT NULL, name TEXT NOT NULL, blob_name TEXT NOT NULL UNIQUE,\
+                 metadata_json TEXT NOT NULL, generation INTEGER NOT NULL,\
+                 created TEXT NOT NULL, updated TEXT NOT NULL, PRIMARY KEY(bucket, name)\
+             );\
+             CREATE INDEX storage_objects_bucket ON storage_objects(bucket, name);\
+             CREATE TABLE event_outbox(\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, payload BLOB NOT NULL,\
+                 state TEXT NOT NULL CHECK(state IN ('pending','in_flight','delivered','failed')),\
+                 attempts INTEGER NOT NULL, available_at INTEGER NOT NULL, lease_until INTEGER,\
+                 last_error TEXT, created_at INTEGER NOT NULL DEFAULT(unixepoch()),\
+                 delivered_at INTEGER\
+             );\
+             CREATE INDEX event_outbox_delivery ON event_outbox(state, available_at, id);\
+             PRAGMA application_id=1178946901;\
+             PRAGMA user_version=1;",
+        )?;
+        transaction.commit()?;
+    } else {
+        let application_id: i64 =
+            connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        if application_id != APPLICATION_ID {
+            return Err(Error::ForeignDatabase);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("firebase-emu-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn initializes_wal_and_rejects_duplicate_owner() {
+        let root = temporary("persistence-owner");
+        let first = Persistence::open(root.clone(), true).await.unwrap();
+        assert_eq!(
+            first
+                .read(|connection| {
+                    connection
+                        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                        .map_err(Error::from)
+                })
+                .await
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let error = Persistence::open(root.clone(), true).await.unwrap_err();
+        assert!(matches!(error, Error::AlreadyOwned(_)));
+        drop(first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_newer_schema_without_resetting_it() {
+        let root = temporary("persistence-newer");
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("firebase-emu.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+        drop(connection);
+        let error = Persistence::open(root.clone(), false).await.unwrap_err();
+        assert!(matches!(error, Error::NewerSchema { found: 99, .. }));
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            99
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_database_fails_without_replacement() {
+        let root = temporary("persistence-corrupt");
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("firebase-emu.sqlite3");
+        let original = b"not a sqlite database";
+        fs::write(&database, original).unwrap();
+        assert!(Persistence::open(root.clone(), false).await.is_err());
+        assert_eq!(fs::read(database).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwritable_data_directory_fails_clearly() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = temporary("persistence-permission");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Persistence::open(parent.join("state"), false).await;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(Error::Io(_))));
+        fs::remove_dir_all(parent).unwrap();
+    }
+}
