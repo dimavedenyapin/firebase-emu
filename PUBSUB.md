@@ -70,14 +70,18 @@ ordering or exactly-once promise.
 
 ## Bounds and deliberate gaps
 
-A message and an entire publish request are each limited to 10 MiB. Pending
-fanout is limited to 10,000 delivery records and 64 MiB of delivery bytes. A
-publish that would cross either bound fails atomically with `RESOURCE_EXHAUSTED`.
-Unacknowledged messages expire after 24 hours; cleanup during broker operations
-removes their delivery records and bounds persistent message growth. Streaming
-output is bounded and honors the client's outstanding-message and byte limits.
-The SQLite writer queue and read permits retain the bounds documented in the
-main README.
+A publisher-supplied `PubsubMessage` (before the server assigns `message_id` and
+`publish_time`) and the sum of those messages in one publish are each limited to
+10 MiB. Delivery reserves bounded space for the assigned fields and gRPC wrapper
+under the 11 MiB transport limit. Pending fanout is limited to 10,000 delivery
+records and 64 MiB of delivery bytes. A publish that would cross a publish or
+backlog bound fails atomically with `RESOURCE_EXHAUSTED`. Unacknowledged messages
+expire after 24 hours; cleanup during broker operations removes their delivery
+records and bounds persistent message growth. Streaming output enforces the
+client's outstanding-message limit. The outstanding-byte limit is a flow-control
+target: when no queued message fits it, one valid message may exceed that target
+so the subscription cannot deadlock. The SQLite writer queue and read permits
+retain the bounds documented in the main README.
 
 Local HTTP push is not needed by either inspected application and is not
 implemented. Creating a push, filtered, dead-letter, ordered, exactly-once,
