@@ -1,6 +1,6 @@
 {
   "name": "firebase-emu-rs",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local Firestore, Auth, Storage, and Functions emulator implemented in Rust",
   "license": "Apache-2.0",
   "repository": "github:dimavedenyapin/firebase-emu",
