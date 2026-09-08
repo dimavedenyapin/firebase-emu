@@ -141,6 +141,7 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
 
   process.env.FIRESTORE_EMULATOR_HOST = `127.0.0.1:${firestorePort}`;
   process.env.FIREBASE_STORAGE_EMULATOR_HOST = `127.0.0.1:${storagePort}`;
+  process.env.PUBSUB_EMULATOR_HOST = `127.0.0.1:${pubsubPort}`;
   process.env.GCLOUD_PROJECT = 'demo-functions-cli';
   const admin = require('firebase-admin');
   const adminApp = admin.initializeApp({projectId: 'demo-functions-cli', storageBucket: 'demo-functions-cli.appspot.com'}, `admin-${suffix}`);
@@ -169,6 +170,18 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
   const bucket = adminApp.storage().bucket();
   await bucket.file('incoming/safe.txt').save(Buffer.from('safe fixture'));
   await bucket.file('incoming/safe.txt').delete();
+  const {PubSub} = require('@google-cloud/pubsub');
+  const pubsub = new PubSub({projectId: 'demo-functions-cli'});
+  const sdkMessageId = await pubsub.topic('fixture-topic').publishMessage({
+    data: Buffer.from(JSON.stringify({payment: 43})),
+    attributes: {tenant: 'sdk'},
+  });
+  assert.ok(sdkMessageId);
+  const triggerSubscriptions = (await pubsub.topic('fixture-topic').getSubscriptions())[0].map(value => value.name);
+  assert.deepEqual(triggerSubscriptions, ['projects/demo-functions-cli/subscriptions/firebase-functions-topic']);
+  const retryMessageId = await pubsub.topic('retry-topic').publishMessage({
+    data: Buffer.from(JSON.stringify({retry: true})),
+  });
   assert.equal((await post('/__/functions/pubsub/fixture-topic', {data: {payment: 42}, attributes: {tenant: 'fixture'}})).status, 202);
   assert.equal((await post('/__/functions/schedule/schedule', {})).status, 202);
   await drain(200);
@@ -180,7 +193,21 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
   assert.deepEqual(named('remove').map(value => value.param).sort(), ['browser', 'node']);
   assert.deepEqual(named('asyncCreate'), [{data: {done: true}, param: 'waited'}]);
   assert.equal(named('write').length, 6);
-  assert.deepEqual(named('topic')[0], {json: {payment: 42}, attributes: {tenant: 'fixture'}});
+  assert.deepEqual(named('topic').sort((left, right) => left.attributes.tenant.localeCompare(right.attributes.tenant)), [
+    {json: {payment: 43}, attributes: {tenant: 'sdk'}},
+    {json: {payment: 42}, attributes: {tenant: 'fixture'}},
+  ].sort((left, right) => left.attributes.tenant.localeCompare(right.attributes.tenant)));
+  const retryRecords = named('topicRetry');
+  assert.deepEqual(retryRecords.map(({timestamp, resource, ...value}) => value), [
+    {id: retryMessageId, attempt: 1, json: {retry: true}},
+    {id: retryMessageId, attempt: 2, json: {retry: true}},
+  ]);
+  assert.match(retryRecords[0].timestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  assert.equal(retryRecords[1].timestamp, retryRecords[0].timestamp);
+  assert.deepEqual(retryRecords.map(value => value.resource), [
+    'projects/demo-functions-cli/topics/retry-topic',
+    'projects/demo-functions-cli/topics/retry-topic',
+  ]);
   assert.equal(named('schedule').length, 1);
   assert.equal(named('finalize')[0].name, 'incoming/safe.txt');
   assert.equal(named('storageDelete')[0].name, 'incoming/safe.txt');
@@ -193,6 +220,7 @@ test('release binary supervises Node22 and dispatches real SDK traffic', {timeou
   assert.ok(failedStatus.failures.some(item => item.error.includes('event failure')));
 
   await adminApp.delete();
+  await pubsub.close();
   child.kill('SIGTERM');
   await new Promise(resolve => child.once('exit', resolve));
   assert.equal(child.exitCode, 0, stderr);

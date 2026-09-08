@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "proto/google/firestore/v1/firestore.proto",
                 "proto/google/firestore/emulator/v1/firestore_emulator.proto",
+                "proto/google/pubsub/v1/pubsub.proto",
                 "proto/google/rpc/status.proto",
                 "proto/google/type/latlng.proto",
             ],

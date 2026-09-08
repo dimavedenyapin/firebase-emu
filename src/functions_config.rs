@@ -19,6 +19,7 @@ pub(crate) struct ConfigOverrides {
     pub project: Option<String>,
     pub host: Option<String>,
     pub functions_port: Option<u16>,
+    pub pubsub_port: Option<u16>,
     pub functions_source: Option<PathBuf>,
     pub functions_codebase: Option<String>,
     pub functions_runtime: Option<String>,
@@ -126,8 +127,8 @@ pub(crate) fn load(
         .host
         .clone()
         .or_else(|| environment.get("FIREBASE_EMU_HOST").cloned());
-    let host = if let Some(host) = explicit_host {
-        parse_loopback_host(&host, false)?
+    let host = if let Some(host) = explicit_host.as_deref() {
+        parse_loopback_host(host, false)?
     } else if let Some(host) = firebase
         .pointer("/emulators/functions/host")
         .and_then(Value::as_str)
@@ -189,14 +190,23 @@ pub(crate) fn load(
             )?,
         ),
         pubsub: SocketAddr::new(
-            host,
-            selected_port(
+            if explicit_host.is_some() {
+                host
+            } else if let Some(pubsub_host) = firebase
+                .pointer("/emulators/pubsub/host")
+                .and_then(Value::as_str)
+            {
+                parse_loopback_host(pubsub_host, true)?
+            } else {
+                host
+            },
+            cli.pubsub_port.unwrap_or(selected_port(
                 environment,
                 &firebase,
                 "PUBSUB_EMULATOR_PORT",
                 "pubsub",
                 8085,
-            )?,
+            )?),
         ),
     };
 
@@ -291,6 +301,44 @@ pub(crate) fn load(
         runtime_config,
         local_environment,
     })
+}
+
+/// Resolve the Pub/Sub listener without requiring a Functions source. This is
+/// used by `--no-functions`, where firebase.json emulator settings still apply.
+pub(crate) fn load_pubsub_address(
+    root: Option<&Path>,
+    cli: &ConfigOverrides,
+    environment: &BTreeMap<String, String>,
+) -> Result<SocketAddr, ConfigError> {
+    let firebase = match root {
+        Some(root) => read_optional_json(&root.join("firebase.json"))?.unwrap_or_else(|| json!({})),
+        None => json!({}),
+    };
+    let explicit_host = cli
+        .host
+        .as_deref()
+        .or_else(|| environment.get("FIREBASE_EMU_HOST").map(String::as_str));
+    let host = if let Some(host) = explicit_host {
+        parse_loopback_host(host, false)?
+    } else if let Some(host) = firebase
+        .pointer("/emulators/pubsub/host")
+        .and_then(Value::as_str)
+    {
+        parse_loopback_host(host, true)?
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    let port = cli.pubsub_port.unwrap_or(selected_port(
+        environment,
+        &firebase,
+        "PUBSUB_EMULATOR_PORT",
+        "pubsub",
+        8085,
+    )?);
+    if port == 0 {
+        return Err("Pub/Sub emulator port must be between 1 and 65535".into());
+    }
+    Ok(SocketAddr::new(host, port))
 }
 
 fn read_optional_json(path: &Path) -> Result<Option<Value>, ConfigError> {
@@ -700,6 +748,33 @@ mod tests {
             loaded.firebase_config
         );
         assert_eq!(child["FIREBASE_AUTH_EMULATOR_HOST"], "127.0.0.1:9190");
+        assert_eq!(child["PUBSUB_EMULATOR_HOST"], "127.0.0.1:8185");
+    }
+
+    #[test]
+    fn pubsub_address_loads_without_a_functions_source() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "firebase.json",
+            r#"{"emulators":{"pubsub":{"host":"localhost","port":8185}}}"#,
+        );
+        let loaded = load_pubsub_address(
+            Some(&fixture.0),
+            &ConfigOverrides::default(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(loaded.to_string(), "127.0.0.1:8185");
+        let overridden = load_pubsub_address(
+            Some(&fixture.0),
+            &ConfigOverrides {
+                pubsub_port: Some(8285),
+                ..Default::default()
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(overridden.to_string(), "127.0.0.1:8285");
     }
 
     #[test]

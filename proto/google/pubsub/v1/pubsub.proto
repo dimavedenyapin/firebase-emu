@@ -1,0 +1,152 @@
+// Copyright 2020 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Protocol-compatible subset of google/pubsub/v1/pubsub.proto. The message
+// names, field numbers, and RPC paths below are copied from googleapis. Fields
+// outside firebase-emu's documented local scope are retained where they must be
+// decoded so the server can reject unsupported configuration explicitly.
+syntax = "proto3";
+
+package google.pubsub.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+service Publisher {
+  rpc CreateTopic(Topic) returns (Topic);
+  rpc UpdateTopic(UpdateTopicRequest) returns (Topic);
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  rpc GetTopic(GetTopicRequest) returns (Topic);
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+  rpc ListTopicSubscriptions(ListTopicSubscriptionsRequest) returns (ListTopicSubscriptionsResponse);
+  rpc ListTopicSnapshots(ListTopicSnapshotsRequest) returns (ListTopicSnapshotsResponse);
+  rpc DeleteTopic(DeleteTopicRequest) returns (google.protobuf.Empty);
+  rpc DetachSubscription(DetachSubscriptionRequest) returns (DetachSubscriptionResponse);
+}
+
+service Subscriber {
+  rpc CreateSubscription(Subscription) returns (Subscription);
+  rpc GetSubscription(GetSubscriptionRequest) returns (Subscription);
+  rpc UpdateSubscription(UpdateSubscriptionRequest) returns (Subscription);
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+  rpc DeleteSubscription(DeleteSubscriptionRequest) returns (google.protobuf.Empty);
+  rpc ModifyAckDeadline(ModifyAckDeadlineRequest) returns (google.protobuf.Empty);
+  rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
+  rpc Pull(PullRequest) returns (PullResponse);
+  rpc StreamingPull(stream StreamingPullRequest) returns (stream StreamingPullResponse);
+  rpc ModifyPushConfig(ModifyPushConfigRequest) returns (google.protobuf.Empty);
+  rpc GetSnapshot(GetSnapshotRequest) returns (Snapshot);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (Snapshot);
+  rpc UpdateSnapshot(UpdateSnapshotRequest) returns (Snapshot);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
+  rpc Seek(SeekRequest) returns (SeekResponse);
+}
+
+message MessageStoragePolicy { repeated string allowed_persistence_regions = 1; bool enforce_in_transit = 2; }
+message SchemaSettings { string schema = 1; int32 encoding = 2; string first_revision_id = 3; string last_revision_id = 4; }
+message Topic {
+  string name = 1;
+  map<string, string> labels = 2;
+  MessageStoragePolicy message_storage_policy = 3;
+  string kms_key_name = 5;
+  SchemaSettings schema_settings = 6;
+  bool satisfies_pzs = 7;
+  google.protobuf.Duration message_retention_duration = 8;
+  int32 state = 9;
+  bytes ingestion_data_source_settings = 10;
+}
+message PubsubMessage {
+  bytes data = 1;
+  map<string, string> attributes = 2;
+  string message_id = 3;
+  google.protobuf.Timestamp publish_time = 4;
+  string ordering_key = 5;
+}
+message GetTopicRequest { string topic = 1; }
+message UpdateTopicRequest { Topic topic = 1; google.protobuf.FieldMask update_mask = 2; }
+message PublishRequest { string topic = 1; repeated PubsubMessage messages = 2; }
+message PublishResponse { repeated string message_ids = 1; }
+message ListTopicsRequest { string project = 1; int32 page_size = 2; string page_token = 3; }
+message ListTopicsResponse { repeated Topic topics = 1; string next_page_token = 2; }
+message ListTopicSubscriptionsRequest { string topic = 1; int32 page_size = 2; string page_token = 3; }
+message ListTopicSubscriptionsResponse { repeated string subscriptions = 1; string next_page_token = 2; }
+message ListTopicSnapshotsRequest { string topic = 1; int32 page_size = 2; string page_token = 3; }
+message ListTopicSnapshotsResponse { repeated string snapshots = 1; string next_page_token = 2; }
+message DeleteTopicRequest { string topic = 1; }
+message DetachSubscriptionRequest { string subscription = 1; }
+message DetachSubscriptionResponse {}
+
+message PushConfig { string push_endpoint = 1; map<string, string> attributes = 2; bytes oidc_token = 3; bytes pubsub_wrapper = 4; bytes no_wrapper = 5; }
+message BigQueryConfig { string table = 1; bool use_topic_schema = 2; bool write_metadata = 3; bool drop_unknown_fields = 4; int32 state = 5; bool use_table_schema = 6; }
+message CloudStorageConfig { string bucket = 1; string filename_prefix = 2; string filename_suffix = 3; bytes text_config = 4; bytes avro_config = 5; google.protobuf.Duration max_duration = 6; int64 max_bytes = 7; int32 state = 9; }
+message ExpirationPolicy { google.protobuf.Duration ttl = 1; }
+message DeadLetterPolicy { string dead_letter_topic = 1; int32 max_delivery_attempts = 2; }
+message RetryPolicy { google.protobuf.Duration minimum_backoff = 1; google.protobuf.Duration maximum_backoff = 2; }
+message Subscription {
+  string name = 1;
+  string topic = 2;
+  PushConfig push_config = 4;
+  int32 ack_deadline_seconds = 5;
+  bool retain_acked_messages = 7;
+  google.protobuf.Duration message_retention_duration = 8;
+  map<string, string> labels = 9;
+  bool enable_message_ordering = 10;
+  ExpirationPolicy expiration_policy = 11;
+  string filter = 12;
+  DeadLetterPolicy dead_letter_policy = 13;
+  RetryPolicy retry_policy = 14;
+  bool detached = 15;
+  bool enable_exactly_once_delivery = 16;
+  google.protobuf.Duration topic_message_retention_duration = 17;
+  BigQueryConfig bigquery_config = 18;
+  int32 state = 19;
+  CloudStorageConfig cloud_storage_config = 22;
+  bytes analytics_hub_subscription_info = 23;
+}
+message ReceivedMessage { string ack_id = 1; PubsubMessage message = 2; int32 delivery_attempt = 3; }
+message GetSubscriptionRequest { string subscription = 1; }
+message UpdateSubscriptionRequest { Subscription subscription = 1; google.protobuf.FieldMask update_mask = 2; }
+message ListSubscriptionsRequest { string project = 1; int32 page_size = 2; string page_token = 3; }
+message ListSubscriptionsResponse { repeated Subscription subscriptions = 1; string next_page_token = 2; }
+message DeleteSubscriptionRequest { string subscription = 1; }
+message ModifyPushConfigRequest { string subscription = 1; PushConfig push_config = 2; }
+message PullRequest { string subscription = 1; bool return_immediately = 2; int32 max_messages = 3; }
+message PullResponse { repeated ReceivedMessage received_messages = 1; }
+message ModifyAckDeadlineRequest { string subscription = 1; int32 ack_deadline_seconds = 3; repeated string ack_ids = 4; }
+message AcknowledgeRequest { string subscription = 1; repeated string ack_ids = 2; }
+message StreamingPullRequest {
+  string subscription = 1;
+  repeated string ack_ids = 2;
+  repeated int32 modify_deadline_seconds = 3 [packed = false];
+  repeated string modify_deadline_ack_ids = 4;
+  int32 stream_ack_deadline_seconds = 5;
+  string client_id = 6;
+  int64 max_outstanding_messages = 7;
+  int64 max_outstanding_bytes = 8;
+}
+message StreamingPullResponse { repeated ReceivedMessage received_messages = 1; }
+
+// Snapshot/seek wire shapes are retained only so calls fail with UNIMPLEMENTED.
+message Snapshot { string name = 1; string topic = 2; google.protobuf.Timestamp expire_time = 3; map<string,string> labels = 4; }
+message GetSnapshotRequest { string snapshot = 1; }
+message ListSnapshotsRequest { string project = 1; int32 page_size = 2; string page_token = 3; }
+message ListSnapshotsResponse { repeated Snapshot snapshots = 1; string next_page_token = 2; }
+message CreateSnapshotRequest { string name = 1; string subscription = 2; map<string,string> labels = 3; }
+message UpdateSnapshotRequest { Snapshot snapshot = 1; google.protobuf.FieldMask update_mask = 2; }
+message DeleteSnapshotRequest { string snapshot = 1; }
+message SeekRequest { string subscription = 1; oneof target { google.protobuf.Timestamp time = 2; string snapshot = 3; } }
+message SeekResponse {}

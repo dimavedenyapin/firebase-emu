@@ -25,6 +25,12 @@ exports.selfLoop=functions.firestore.document('loop/{itemId}').onWrite(async(cha
 });
 exports.eventFail=functions.firestore.document('bad/{id}').onWrite(async()=>{throw Error('event failure');});
 exports.topic=functions.pubsub.topic('fixture-topic').onPublish(message=>record('topic',{json:message.json,attributes:message.attributes}));
+const pubsubAttempts=new Map();
+exports.topicRetry=functions.pubsub.topic('retry-topic').onPublish((message,context)=>{
+ const attempt=(pubsubAttempts.get(context.eventId)||0)+1; pubsubAttempts.set(context.eventId,attempt);
+ record('topicRetry',{id:context.eventId,attempt,json:message.json,timestamp:context.timestamp,resource:context.resource.name});
+ if(attempt===1) throw Error('retry fixture fails once');
+});
 exports.schedule=functions.pubsub.schedule('every 5 minutes').onRun(ctx=>record('schedule',{eventId:ctx.eventId}));
 exports.finalize=functions.storage.object().onFinalize((object,ctx)=>record('finalize',{bucket:object.bucket,name:object.name,generation:object.generation,eventId:ctx.eventId}));
 exports.storageDelete=functions.storage.object().onDelete(object=>record('storageDelete',{bucket:object.bucket,name:object.name}));

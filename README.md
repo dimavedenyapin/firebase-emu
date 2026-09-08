@@ -1,9 +1,9 @@
 # Firebase emulator in Rust
 
-One loopback-only process serves Firestore gRPC and browser
-WebChannel (8080), Auth REST (9099), Storage REST (9199), and optional Firebase
-Functions (5001). It is intended for local development and tests with `demo-`
-projects, not production traffic. The backwards-compatible default is
+One loopback-only process serves Firestore gRPC and browser WebChannel (8080),
+Auth REST (9099), Storage REST (9199), Google Pub/Sub gRPC (8085), and optional
+Firebase Functions (5001). It is intended for local development and tests with
+`demo-` projects, not production traffic. The backwards-compatible default is
 in-memory; `--data-dir` opts into durable local persistence.
 
 ## Install and run
@@ -68,8 +68,18 @@ GCLOUD_PROJECT=demo-sdk-compat ./target/release/firebase-emu --no-functions
 ```
 
 `FIREBASE_EMU_HOST` selects a loopback IP. `FIRESTORE_EMU_PORT`,
-`FIREBASE_AUTH_EMU_PORT`, and `FIREBASE_STORAGE_EMU_PORT` change the three
-service ports.
+`FIREBASE_AUTH_EMU_PORT`, `FIREBASE_STORAGE_EMU_PORT`, and
+`PUBSUB_EMULATOR_PORT` change service ports. `--pubsub-port` overrides the
+Pub/Sub port, and `firebase.json` can configure it with normal Firebase
+conventions:
+
+```json
+{
+  "emulators": {
+    "pubsub": { "host": "127.0.0.1", "port": 8085 }
+  }
+}
+```
 
 ## Durable local data
 
@@ -98,8 +108,12 @@ installed SQLite library is required. Firestore protobufs are stored without a
 JSON conversion, preserving 64-bit integers, timestamps, bytes, references,
 geopoints, nested values, NaN, full resource names, and document timestamps.
 Auth users, password material, custom claims, ID/refresh sessions, revocation
-state, and Storage metadata are durable. Active Firestore transaction handles,
+state, Storage metadata, and Pub/Sub topics, subscriptions, messages, delivery
+leases, and acknowledgements are durable. Active Firestore transaction handles,
 open HTTP requests, sockets, and incomplete resumable uploads are process-local.
+Opening an existing schema-v1 data directory performs a transactional migration
+to schema v2 without replacing its Firestore, Auth, Storage, or Functions outbox
+data.
 
 One bounded 128-entry writer queue serializes SQLite transactions on a
 dedicated OS thread. Up to eight blocking read connections can run
@@ -173,8 +187,14 @@ runtime config; owns public routing and child lifecycle; and starts one private
 Node worker per codebase. HTTP/callable endpoints use
 `http://127.0.0.1:5001/<project>/<region>/<function>`. Supported v1 background
 triggers are Firestore create/update/delete/write, Storage finalize/delete,
-Pub/Sub publish, and schedules. Pub/Sub and schedules use local injection APIs;
-there is no Pub/Sub service on port 8085. See [FUNCTIONS-CONFIG.md](FUNCTIONS-CONFIG.md).
+Pub/Sub publish, and schedules. At startup every v1
+`functions.pubsub.topic(...).onPublish(...)` export is registered with a local
+topic and an independent durable subscription before the Functions-ready log is
+printed. Real SDK publishes then flow through that subscription; the handler is
+ACKed only after success and is redelivered after failure. The existing explicit
+HTTP injection route remains available for compatibility and invokes handlers
+directly, so one request cannot enter both paths or double-dispatch. See
+[FUNCTIONS-CONFIG.md](FUNCTIONS-CONFIG.md) and [PUBSUB.md](PUBSUB.md).
 
 ## Deterministic test setup
 
@@ -196,6 +216,7 @@ cargo check --all-targets
 cargo clippy --all-targets
 cargo test --all-targets
 npm test --prefix functions-runtime
+npm run test:pubsub --prefix functions-runtime
 npm test --prefix examples/node-app
 npm test --prefix examples/web-app
 ```
@@ -245,14 +266,25 @@ Storage supports Node GCS and browser upload/download/list/delete, CORS,
 CRC32C metadata, and resumable chunks. Abandoned resumable sessions expire
 after one hour and are pruned opportunistically.
 
+Pub/Sub supports real `google.pubsub.v1.Publisher` and `Subscriber` gRPC APIs
+for topic/subscription CRUD and listing, publishing, unary Pull, StreamingPull,
+ACK, deadline extension, nack/redelivery, per-subscription fanout, and restart
+recovery. The tested Node clients are `@google-cloud/pubsub` 4.11.0 (the current
+`upload-functions` lock) and 2.19.4 (the current `peakflo-web/functions` lock).
+Set `PUBSUB_EMULATOR_HOST=127.0.0.1:8085`; credentials and production endpoints
+are not used. See [PUBSUB.md](PUBSUB.md) for an SDK example and precise limits.
+
 ## Deliberate limits
 
 This emulator does not implement Security Rules, production transaction
 isolation, composite-index enforcement, aggregation or partition queries, or
 Firestore maximum/minimum/array-remove transforms. Storage does not implement
 resumable retry recovery, IAM, or signed-URL verification. Auth is not a full
-production identity service. Auth, RTDB, Eventarc, task queue, analytics, and
-Functions v2/CloudEvent triggers are not implemented.
+production identity service. Pub/Sub push delivery, IAM, schemas, filters,
+snapshots/seek, dead-letter policies, ordering guarantees, exactly-once delivery,
+and Functions v2/CloudEvent Pub/Sub triggers are not implemented. Unsupported
+Pub/Sub configuration is rejected instead of being accepted and discarded.
+RTDB, Eventarc, task queue, and analytics are not implemented.
 
 The final pre-cleanup validation historically passed 45 Rust tests, a 68-check
 SDK matrix, and two separate real-application compatibility suites (18 checks

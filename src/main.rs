@@ -4,6 +4,7 @@ mod firestore_web;
 mod functions;
 mod functions_config;
 mod persistence;
+mod pubsub;
 mod storage;
 
 use std::{
@@ -75,6 +76,10 @@ fn command_line() -> Result<CommandLine, BoxError> {
                 result.functions.functions_port =
                     Some(option_value(&mut args, "--functions-port")?.parse()?)
             }
+            "--pubsub-port" => {
+                result.functions.pubsub_port =
+                    Some(option_value(&mut args, "--pubsub-port")?.parse()?)
+            }
             "--functions-source" => {
                 result.functions.functions_source = Some(PathBuf::from(option_value(
                     &mut args,
@@ -98,7 +103,7 @@ fn command_line() -> Result<CommandLine, BoxError> {
             }
             "--no-functions" => result.no_functions = true,
             "--help" | "-h" => {
-                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions]");
+                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--pubsub-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions]");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option `{argument}` (use --help)").into()),
@@ -155,30 +160,35 @@ async fn main() {
 
 async fn run() -> Result<(), BoxError> {
     let cli = command_line()?;
+    let config_root = configured_root(&cli)?;
+    let environment = environment_snapshot();
     let functions_config = if cli.no_functions {
         None
-    } else if let Some(root) = configured_root(&cli)? {
-        Some(functions_config::load(
-            &root,
-            &cli.functions,
-            &environment_snapshot(),
-        )?)
+    } else if let Some(root) = &config_root {
+        Some(functions_config::load(root, &cli.functions, &environment)?)
     } else {
         None
     };
-    let (firestore_addr, auth_addr, storage_addr) = if let Some(config) = &functions_config {
-        (
-            config.addresses.firestore,
-            config.addresses.auth,
-            config.addresses.storage,
-        )
-    } else {
-        (
-            address("FIRESTORE_EMU_PORT", 8080)?,
-            address("FIREBASE_AUTH_EMU_PORT", 9099)?,
-            address("FIREBASE_STORAGE_EMU_PORT", 9199)?,
-        )
-    };
+    let (firestore_addr, auth_addr, storage_addr, pubsub_addr) =
+        if let Some(config) = &functions_config {
+            (
+                config.addresses.firestore,
+                config.addresses.auth,
+                config.addresses.storage,
+                config.addresses.pubsub,
+            )
+        } else {
+            (
+                address("FIRESTORE_EMU_PORT", 8080)?,
+                address("FIREBASE_AUTH_EMU_PORT", 9099)?,
+                address("FIREBASE_STORAGE_EMU_PORT", 9199)?,
+                functions_config::load_pubsub_address(
+                    config_root.as_deref(),
+                    &cli.functions,
+                    &environment,
+                )?,
+            )
+        };
     let auth_project = functions_config
         .as_ref()
         .map(|config| config.project_id.as_str())
@@ -206,10 +216,13 @@ async fn run() -> Result<(), BoxError> {
     };
     let auth_router = auth::router_for_project(auth_project, persistence.clone());
     let storage_router = storage::router(persistence.clone()).await?;
+    let pubsub = pubsub::PubSubService::new(persistence.clone());
 
     eprintln!("Firestore emulator listening on {firestore_addr}");
     eprintln!("Auth emulator listening on {auth_addr}");
     eprintln!("Storage emulator listening on {storage_addr}");
+    eprintln!("Pub/Sub emulator listening on {pubsub_addr}");
+    eprintln!("SDK connection: PUBSUB_EMULATOR_HOST={pubsub_addr}");
 
     if let Some(config) = functions_config {
         // Every service is long-lived. A clean Functions shutdown or any service
@@ -218,13 +231,15 @@ async fn run() -> Result<(), BoxError> {
             result = firestore::serve(firestore_addr, persistence.clone()) => result,
             result = serve_http(auth_addr, auth_router) => result,
             result = serve_http(storage_addr, storage_router) => result,
-            result = functions::serve(config, persistence.clone()) => result,
+            result = pubsub::serve(pubsub_addr, pubsub.clone()) => result,
+            result = functions::serve(config, persistence.clone(), pubsub) => result,
         }
     } else {
         tokio::try_join!(
             firestore::serve(firestore_addr, persistence.clone()),
             serve_http(auth_addr, auth_router),
             serve_http(storage_addr, storage_router),
+            pubsub::serve(pubsub_addr, pubsub),
         )?;
         Ok(())
     }

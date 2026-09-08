@@ -139,15 +139,16 @@ def smoke(args: argparse.Namespace) -> None:
 
         environment = os.environ.copy()
         environment.pop("FIREBASE_FUNCTIONS_ADAPTER", None)
-        firestore, auth, storage = (free_port() for _ in range(3))
+        firestore, auth, storage, pubsub = (free_port() for _ in range(4))
         environment.update({
             "FIRESTORE_EMU_PORT": str(firestore),
             "FIREBASE_AUTH_EMU_PORT": str(auth),
             "FIREBASE_STORAGE_EMU_PORT": str(storage),
+            "PUBSUB_EMULATOR_PORT": str(pubsub),
         })
         process = run_binary(binary, ["--no-functions"], environment)
         try:
-            for port in (firestore, auth, storage):
+            for port in (firestore, auth, storage, pubsub):
                 wait_tcp(port, process)
             status, _ = http_status(f"http://127.0.0.1:{auth}/")
             if status == 0:
@@ -159,7 +160,7 @@ def smoke(args: argparse.Namespace) -> None:
         persistence_args = ["--data-dir", str(data_dir), "--no-functions"]
         process = run_binary(binary, persistence_args, environment)
         try:
-            for port in (firestore, auth, storage):
+            for port in (firestore, auth, storage, pubsub):
                 wait_tcp(port, process)
             duplicate = run_binary(binary, persistence_args, environment)
             try:
@@ -205,7 +206,7 @@ def smoke(args: argparse.Namespace) -> None:
 
         process = run_binary(binary, persistence_args, environment)
         try:
-            for port in (firestore, auth, storage):
+            for port in (firestore, auth, storage, pubsub):
                 wait_tcp(port, process)
             status, body = http_request(
                 f"http://127.0.0.1:{firestore}/v1/projects/demo-release/databases/(default)/documents:batchGet",
