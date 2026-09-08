@@ -34,6 +34,9 @@ use google::pubsub::v1::{
 
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_PUBLISH_BYTES: usize = 10 * 1024 * 1024;
+// The public limit applies before the server adds message_id and publish_time.
+// Reserve bounded response space for those fields and delivery wrappers.
+const MAX_DELIVERY_MESSAGE_BYTES: usize = MAX_MESSAGE_BYTES + 1024;
 const MAX_TRANSPORT_BYTES: usize = 11 * 1024 * 1024;
 const MAX_PENDING_DELIVERIES: i64 = 10_000;
 const MAX_PENDING_BYTES: i64 = 64 * 1024 * 1024;
@@ -666,6 +669,11 @@ impl PubSubService {
         for message in &mut messages {
             message.message_id = uuid::Uuid::new_v4().to_string();
             message.publish_time = Some(published);
+            if message.encoded_len() > MAX_DELIVERY_MESSAGE_BYTES {
+                return Err(Status::resource_exhausted(
+                    "message exceeds delivery response budget",
+                ));
+            }
             ids.push(message.message_id.clone());
         }
         if let Some(persistence) = &self.persistence {
@@ -780,7 +788,7 @@ impl PubSubService {
         subscription: &str,
     ) -> Result<Option<BrokerMessage>, Status> {
         let mut values = self
-            .claim(subscription, 1, MAX_MESSAGE_BYTES as i64, None)
+            .claim(subscription, 1, MAX_DELIVERY_MESSAGE_BYTES as i64, None)
             .await?;
         Ok(values.pop())
     }
@@ -831,9 +839,21 @@ impl PubSubService {
                 }
                 let mut result = Vec::new();
                 let mut used = 0i64;
+                let has_fitting_message = candidates
+                    .iter()
+                    .any(|(_, _, size, _)| *size <= max_bytes);
                 for (message_id, encoded, size, attempts) in candidates {
                     if result.len() >= max_count { break; }
-                    if used.saturating_add(size) > max_bytes { continue; }
+                    if size > MAX_DELIVERY_MESSAGE_BYTES as i64 {
+                        return Err(crate::persistence::Error::Corrupt(format!("Pub/Sub message {message_id} exceeds delivery response budget")));
+                    }
+                    // Byte flow control is a target. If nothing fits, allow one
+                    // valid message so it cannot stall the subscription forever.
+                    if used.saturating_add(size) > max_bytes
+                        && (!result.is_empty() || has_fitting_message)
+                    {
+                        continue;
+                    }
                     let ack_id = uuid::Uuid::new_v4().to_string();
                     let changed = transaction.execute("UPDATE pubsub_deliveries SET state='in_flight',ack_id=?3,deadline=?4,attempts=attempts+1 WHERE subscription_name=?1 AND message_id=?2 AND state='available'", params![subscription,message_id,ack_id,deadline])?;
                     if changed == 1 {
@@ -867,12 +887,23 @@ impl PubSubService {
                 .collect();
             let mut result = Vec::new();
             let mut used = 0i64;
+            let has_fitting_message = keys
+                .iter()
+                .any(|key| state.message_sizes.get(&key.1).copied().unwrap_or(0) <= max_bytes);
             for key in keys {
                 if result.len() >= max_count {
                     break;
                 }
                 let size = *state.message_sizes.get(&key.1).unwrap_or(&0);
-                if used.saturating_add(size) > max_bytes {
+                if size > MAX_DELIVERY_MESSAGE_BYTES as i64 {
+                    return Err(Status::internal(format!(
+                        "Pub/Sub message {} exceeds delivery response budget",
+                        key.1
+                    )));
+                }
+                if used.saturating_add(size) > max_bytes
+                    && (!result.is_empty() || has_fitting_message)
+                {
                     continue;
                 }
                 let message = state
@@ -1320,7 +1351,7 @@ impl Subscriber for PubSubService {
                 .claim(
                     &request.subscription,
                     request.max_messages.min(1000) as usize,
-                    MAX_MESSAGE_BYTES as i64,
+                    MAX_DELIVERY_MESSAGE_BYTES as i64,
                     None,
                 )
                 .await?;
@@ -1471,7 +1502,7 @@ impl Subscriber for PubSubService {
                             (max_messages - outstanding.len()).min(100),
                             (max_bytes - used_bytes)
                                 .max(0)
-                                .min(MAX_MESSAGE_BYTES as i64),
+                                .min(MAX_DELIVERY_MESSAGE_BYTES as i64),
                             Some(stream_deadline),
                         )
                         .await
@@ -1914,6 +1945,67 @@ mod tests {
                 .await
                 .unwrap(),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_publish_limit_remains_deliverable_after_server_metadata() {
+        let service = PubSubService::new(None);
+        service
+            .create_topic_value(topic("demo-boundary", "events"))
+            .await
+            .unwrap();
+        service
+            .create_subscription_value(subscription("demo-boundary", "worker", "events"))
+            .await
+            .unwrap();
+        let boundary = PubsubMessage {
+            // One field tag plus a four-byte protobuf length prefix makes the
+            // publisher-supplied message exactly 10 MiB.
+            data: vec![0x62; MAX_MESSAGE_BYTES - 5],
+            ..Default::default()
+        };
+        assert_eq!(boundary.encoded_len(), MAX_MESSAGE_BYTES);
+        let id = service
+            .publish_values("projects/demo-boundary/topics/events", vec![boundary])
+            .await
+            .unwrap()
+            .remove(0);
+        let delivered = service
+            .pull_one("projects/demo-boundary/subscriptions/worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.message.message_id, id);
+        assert!(delivered.message.encoded_len() > MAX_MESSAGE_BYTES);
+        assert!(delivered.message.encoded_len() <= MAX_DELIVERY_MESSAGE_BYTES);
+        service
+            .acknowledge_ids(
+                "projects/demo-boundary/subscriptions/worker",
+                &[delivered.ack_id],
+            )
+            .await
+            .unwrap();
+
+        let oversized = PubsubMessage {
+            data: vec![0x6f; MAX_MESSAGE_BYTES - 4],
+            ..Default::default()
+        };
+        assert_eq!(oversized.encoded_len(), MAX_MESSAGE_BYTES + 1);
+        assert_eq!(
+            service
+                .publish_values("projects/demo-boundary/topics/events", vec![oversized])
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert_eq!(
+            service
+                .pending_count(&["projects/demo-boundary/subscriptions/worker".into()])
+                .await
+                .unwrap(),
+            0
         );
     }
 

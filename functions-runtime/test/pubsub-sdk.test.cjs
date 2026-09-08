@@ -71,14 +71,22 @@ function received(subscription, action = message => message.ack(), timeout = 150
   });
 }
 
-function rawSubscriber(host) {
+function rawClient(host, service, options = {}) {
   const grpc = require('@grpc/grpc-js');
   const protoLoader = require('@grpc/proto-loader');
   const definition = protoLoader.loadSync(path.join(repository, 'proto/google/pubsub/v1/pubsub.proto'), {
     includeDirs: [path.join(repository, 'proto'), path.join(repository, 'functions-runtime/node_modules/google-gax/build/protos')],
   });
-  const Subscriber = grpc.loadPackageDefinition(definition).google.pubsub.v1.Subscriber;
-  return new Subscriber(host, grpc.credentials.createInsecure());
+  const Service = grpc.loadPackageDefinition(definition).google.pubsub.v1[service];
+  return new Service(host, grpc.credentials.createInsecure(), options);
+}
+
+function rawSubscriber(host, options) {
+  return rawClient(host, 'Subscriber', options);
+}
+
+function rawPublisher(host, options) {
+  return rawClient(host, 'Publisher', options);
 }
 
 function unary(client, method, request) {
@@ -378,6 +386,103 @@ test('StreamingPull reconciles broker leases at max one in memory and SQLite', {
       }
       subscriber.close();
       await pubsub.close();
+      await server.stop();
+      if (dataDir) fs.rmSync(dataDir, {recursive: true, force: true});
+    }
+  }
+});
+
+test('10 MiB publish boundary remains deliverable in memory and SQLite', {timeout: 120000}, async () => {
+  const messageLimit = 10 * 1024 * 1024;
+  const transportLimit = 11 * 1024 * 1024;
+  // Field tag (1 byte) plus the four-byte protobuf length prefix makes this
+  // publisher-supplied PubsubMessage exactly 10 MiB before server metadata.
+  const boundaryData = Buffer.alloc(messageLimit - 5, 0x62);
+  const oversizedData = Buffer.alloc(messageLimit - 4, 0x6f);
+  for (const mode of ['memory', 'persistent']) {
+    const dataDir = mode === 'persistent'
+      ? fs.mkdtempSync(path.join(os.tmpdir(), 'firebase-emu-pubsub-boundary-'))
+      : undefined;
+    const server = await start(dataDir);
+    const options = {
+      'grpc.max_send_message_length': transportLimit,
+      'grpc.max_receive_message_length': transportLimit,
+    };
+    const publisher = rawPublisher(server.host, options);
+    const subscriber = rawSubscriber(server.host, options);
+    let stream;
+    try {
+      const project = `demo-pubsub-boundary-${mode}`;
+      const topic = `projects/${project}/topics/boundary-topic`;
+      const unarySubscription = `projects/${project}/subscriptions/boundary-unary`;
+      const streamSubscription = `projects/${project}/subscriptions/boundary-stream`;
+      await unary(publisher, 'createTopic', {name: topic});
+      await unary(subscriber, 'createSubscription', {
+        name: unarySubscription,
+        topic,
+        ackDeadlineSeconds: 10,
+      });
+      await unary(subscriber, 'createSubscription', {
+        name: streamSubscription,
+        topic,
+        ackDeadlineSeconds: 10,
+      });
+
+      stream = subscriber.streamingPull();
+      const streamedMessage = nextStreamMessage(stream, 30000);
+      stream.write({
+        subscription: streamSubscription,
+        streamAckDeadlineSeconds: 10,
+        maxOutstandingMessages: 1,
+        maxOutstandingBytes: 1,
+      });
+      const published = await unary(publisher, 'publish', {
+        topic,
+        messages: [{data: boundaryData}],
+      });
+      assert.equal(published.messageIds.length, 1, `${mode}: exact boundary accepted`);
+
+      const streamed = await streamedMessage;
+      assert.equal(streamed.message.messageId, published.messageIds[0]);
+      assert.equal(streamed.message.data.length, boundaryData.length);
+      await unary(subscriber, 'acknowledge', {
+        subscription: streamSubscription,
+        ackIds: [streamed.ackId],
+      });
+
+      const pulled = await unary(subscriber, 'pull', {
+        subscription: unarySubscription,
+        maxMessages: 1,
+        returnImmediately: true,
+      });
+      assert.equal(pulled.receivedMessages.length, 1, `${mode}: exact boundary unary delivery`);
+      assert.equal(pulled.receivedMessages[0].message.messageId, published.messageIds[0]);
+      assert.equal(pulled.receivedMessages[0].message.data.length, boundaryData.length);
+      await unary(subscriber, 'acknowledge', {
+        subscription: unarySubscription,
+        ackIds: [pulled.receivedMessages[0].ackId],
+      });
+
+      await assert.rejects(
+        () => unary(publisher, 'publish', {topic, messages: [{data: oversizedData}]}),
+        error => error.code === 8,
+        `${mode}: one byte beyond the message limit is rejected`,
+      );
+      const empty = await unary(subscriber, 'pull', {
+        subscription: unarySubscription,
+        maxMessages: 1,
+        returnImmediately: true,
+      });
+      assert.deepEqual(empty.receivedMessages || [], [], `${mode}: rejected publish is atomic`);
+    } catch (error) {
+      throw Error(`${error.stack}\n${mode} emulator stderr:\n${server.stderr()}`);
+    } finally {
+      if (stream) {
+        stream.on('error', () => {});
+        stream.end();
+      }
+      publisher.close();
+      subscriber.close();
       await server.stop();
       if (dataDir) fs.rmSync(dataDir, {recursive: true, force: true});
     }
