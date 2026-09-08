@@ -76,6 +76,8 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Build release binary for restart tests
         run: cargo build --locked --release
+      - name: Test real Pub/Sub SDK streaming, fanout, limits, and restart
+        run: npm run test:pubsub --prefix functions-runtime
       - name: Install Chromium for SDK and restart tests
         run: npx --prefix examples/web-app playwright install --with-deps chromium
       - name: Test real Node and browser SDK traffic

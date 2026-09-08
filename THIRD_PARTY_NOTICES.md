@@ -1,7 +1,7 @@
 # Third-party notices
 
 The reduced Protocol Buffer definitions under `proto/google/firestore/v1`,
-`proto/google/rpc`, and `proto/google/type` are modified from the
+`proto/google/pubsub/v1`, `proto/google/rpc`, and `proto/google/type` are modified from the
 [`googleapis/googleapis`](https://github.com/googleapis/googleapis) public API
 definitions. Copyright Google LLC; licensed under Apache License 2.0. The
 repository's `LICENSE` contains the applicable license text. Each modified

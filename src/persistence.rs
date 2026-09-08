@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x4645_4d55; // "FEMU"
 const WRITER_QUEUE_CAPACITY: usize = 128;
 const MAX_READERS: usize = 8;
@@ -262,7 +262,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     if integrity != "ok" {
         return Err(Error::Corrupt(integrity));
     }
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(Error::NewerSchema {
             found: version,
@@ -319,12 +319,41 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              PRAGMA user_version=1;",
         )?;
         transaction.commit()?;
-    } else {
-        let application_id: i64 =
-            connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-        if application_id != APPLICATION_ID {
-            return Err(Error::ForeignDatabase);
-        }
+        version = 1;
+    }
+    let application_id: i64 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    if application_id != APPLICATION_ID {
+        return Err(Error::ForeignDatabase);
+    }
+    if version == 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE pubsub_topics(\
+                 name TEXT PRIMARY KEY NOT NULL, topic BLOB NOT NULL\
+             );\
+             CREATE TABLE pubsub_subscriptions(\
+                 name TEXT PRIMARY KEY NOT NULL, topic_name TEXT NOT NULL, subscription BLOB NOT NULL\
+             );\
+             CREATE INDEX pubsub_subscriptions_topic ON pubsub_subscriptions(topic_name, name);\
+             CREATE TABLE pubsub_messages(\
+                 message_id TEXT PRIMARY KEY NOT NULL, topic_name TEXT NOT NULL, message BLOB NOT NULL,\
+                 size_bytes INTEGER NOT NULL, published_at INTEGER NOT NULL, expire_at INTEGER NOT NULL\
+             );\
+             CREATE INDEX pubsub_messages_expiry ON pubsub_messages(expire_at);\
+             CREATE TABLE pubsub_deliveries(\
+                 subscription_name TEXT NOT NULL, message_id TEXT NOT NULL,\
+                 state TEXT NOT NULL CHECK(state IN ('available','in_flight')),\
+                 ack_id TEXT, deadline INTEGER, attempts INTEGER NOT NULL DEFAULT 0,\
+                 PRIMARY KEY(subscription_name, message_id),\
+                 FOREIGN KEY(subscription_name) REFERENCES pubsub_subscriptions(name) ON DELETE CASCADE,\
+                 FOREIGN KEY(message_id) REFERENCES pubsub_messages(message_id) ON DELETE CASCADE\
+             );\
+             CREATE UNIQUE INDEX pubsub_delivery_ack ON pubsub_deliveries(ack_id) WHERE ack_id IS NOT NULL;\
+             CREATE INDEX pubsub_delivery_claim ON pubsub_deliveries(subscription_name, state, deadline, message_id);\
+             PRAGMA user_version=2;",
+        )?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -356,6 +385,91 @@ mod tests {
         let error = Persistence::open(root.clone(), true).await.unwrap_err();
         assert!(matches!(error, Error::AlreadyOwned(_)));
         drop(first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrates_v1_in_place_without_losing_existing_service_data() {
+        let root = temporary("persistence-v1-migration");
+        let persistence = Persistence::open(root.clone(), false).await.unwrap();
+        let database = persistence.database_path().to_owned();
+        drop(persistence);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO firestore_documents(name,database_name,document) VALUES ('projects/demo/databases/(default)/documents/items/kept','projects/demo/databases/(default)',x'010203')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO auth_users(namespace,uid,user_json,password) VALUES ('demo','kept-user','{\"localId\":\"kept-user\"}','hash')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO storage_objects(bucket,name,blob_name,metadata_json,generation,created,updated) VALUES ('demo.appspot.com','kept.bin','kept-blob','{}',7,'created','updated')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO event_outbox(source,payload,state,attempts,available_at) VALUES ('fixture',x'0405','pending',0,0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE pubsub_deliveries;
+                 DROP TABLE pubsub_messages;
+                 DROP TABLE pubsub_subscriptions;
+                 DROP TABLE pubsub_topics;
+                 PRAGMA user_version=1;",
+            )
+            .unwrap();
+        drop(connection);
+        let persistence = Persistence::open(root.clone(), false).await.unwrap();
+        let (version, firestore, auth, storage, outbox, pubsub_tables) = persistence
+            .read(|connection| {
+                Ok((
+                    connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+                    connection.query_row(
+                        "SELECT document FROM firestore_documents WHERE name LIKE '%/items/kept'",
+                        [],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT user_json FROM auth_users WHERE namespace='demo' AND uid='kept-user'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT generation FROM storage_objects WHERE bucket='demo.appspot.com' AND name='kept.bin'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT payload FROM event_outbox WHERE source='fixture'",
+                        [],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'pubsub_%'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(firestore, vec![1, 2, 3]);
+        assert_eq!(auth, r#"{"localId":"kept-user"}"#);
+        assert_eq!(storage, 7);
+        assert_eq!(outbox, vec![4, 5]);
+        assert_eq!(pubsub_tables, 4);
+        drop(persistence);
         fs::remove_dir_all(root).unwrap();
     }
 

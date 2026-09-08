@@ -3,6 +3,7 @@ use crate::{
     firestore::google::firestore::v1::Document,
     functions_config::{FunctionCodebase, FunctionsConfig},
     persistence::{OutboxRecord, Persistence},
+    pubsub::{self, PubSubService},
     BoxError,
 };
 use axum::{
@@ -292,6 +293,8 @@ struct Runtime {
     workers: Vec<Worker>,
     client: reqwest::Client,
     hub: Arc<Hub>,
+    pubsub: PubSubService,
+    trigger_subscriptions: Vec<String>,
 }
 
 fn wildcard_params(pattern: &str, path: &str) -> Option<Value> {
@@ -319,9 +322,16 @@ fn event_kind(before: bool, after: bool) -> &'static str {
 }
 impl Runtime {
     async fn status(&self) -> Value {
-        let volatile_pending = self.hub.pending.load(Ordering::SeqCst) as i64;
-        let volatile_completed = self.hub.completed.load(Ordering::SeqCst) as i64;
         let mut failures = self.hub.failures.lock().unwrap().clone();
+        let broker_pending = match self.pubsub.pending_count(&self.trigger_subscriptions).await {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(json!({"eventId":null,"error":format!("Pub/Sub status: {error}")}));
+                0
+            }
+        };
+        let volatile_pending = self.hub.pending.load(Ordering::SeqCst) as i64 + broker_pending;
+        let volatile_completed = self.hub.completed.load(Ordering::SeqCst) as i64;
         let Some(persistence) = &self.hub.persistence else {
             return json!({"pending":volatile_pending,"completed":volatile_completed,"failures":failures});
         };
@@ -499,6 +509,27 @@ impl Runtime {
             Err(errors.join("; "))
         }
     }
+    async fn dispatch_pubsub_function(
+        &self,
+        worker: &Worker,
+        function: &Function,
+        message: Value,
+    ) -> Result<(), String> {
+        let event = &function.trigger["eventTrigger"];
+        let event_type = event["eventType"]
+            .as_str()
+            .unwrap_or("google.pubsub.topic.publish");
+        let resource = event["resource"].as_str().unwrap_or_default();
+        let context = json!({
+            "eventId": message["messageId"],
+            "timestamp": message["publishTime"],
+            "eventType": event_type,
+            "resource": {"service":"pubsub.googleapis.com","name":resource},
+            "params":{}
+        });
+        self.post_event(worker, &function.name, message, context)
+            .await
+    }
     async fn dispatch_schedule(&self, id: u64, function: &str) -> Result<(), String> {
         let Some((worker, f)) = self.workers.iter().find_map(|worker| {
             worker
@@ -531,6 +562,100 @@ impl Runtime {
             EventSource::Schedule { function } => self.dispatch_schedule(event.id, function).await,
         }
     }
+}
+
+fn pubsub_trigger_topic(function: &Function) -> Option<&str> {
+    let event = function.trigger.get("eventTrigger")?;
+    if event.get("eventType")?.as_str()? != "google.pubsub.topic.publish"
+        || function.trigger.get("schedule").is_some()
+    {
+        return None;
+    }
+    event.get("resource")?.as_str()?.rsplit('/').next()
+}
+
+async fn register_pubsub_triggers(
+    runtime: &Runtime,
+) -> Result<(Vec<String>, Vec<tokio::task::JoinHandle<()>>), BoxError> {
+    let mut subscriptions = Vec::new();
+    let mut registrations = Vec::new();
+    for worker in &runtime.workers {
+        for function in &worker.functions {
+            let Some(topic) = pubsub_trigger_topic(function) else {
+                continue;
+            };
+            let subscription_id = format!("firebase-functions-{}", function.name);
+            if subscription_id.len() > 255 {
+                return Err(format!(
+                    "Pub/Sub trigger function name is too long for a subscription: {}",
+                    function.name
+                )
+                .into());
+            }
+            let subscription = runtime
+                .pubsub
+                .ensure_trigger_subscription(&runtime.project, topic, &subscription_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "could not register Pub/Sub trigger {}: {error}",
+                        function.name
+                    )
+                })?;
+            subscriptions.push(subscription.clone());
+            registrations.push((worker.clone(), function.clone(), subscription));
+        }
+    }
+    let mut tasks = Vec::with_capacity(registrations.len());
+    for (worker, function, subscription) in registrations {
+        let runtime = runtime.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                match runtime.pubsub.pull_one_wait(&subscription).await {
+                    Ok(delivery) => {
+                        let ack_id = delivery.ack_id.clone();
+                        let message = pubsub::message_json(&delivery.message);
+                        if runtime
+                            .dispatch_pubsub_function(&worker, &function, message)
+                            .await
+                            .is_ok()
+                        {
+                            match runtime
+                                .pubsub
+                                .acknowledge_ids(&subscription, &[ack_id])
+                                .await
+                            {
+                                Ok(()) => {
+                                    runtime.hub.completed.fetch_add(1, Ordering::SeqCst);
+                                }
+                                Err(error) => record_failure(
+                                    &runtime.hub,
+                                    None,
+                                    format!("Pub/Sub trigger ACK {}: {error}", function.name),
+                                ),
+                            }
+                        } else {
+                            let _ = runtime
+                                .pubsub
+                                .modify_ack_ids(&subscription, &[ack_id], 1)
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                    Err(error) if error.code() == tonic::Code::NotFound => break,
+                    Err(error) => {
+                        record_failure(
+                            &runtime.hub,
+                            None,
+                            format!("Pub/Sub trigger {}: {error}", function.name),
+                        );
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        }));
+    }
+    Ok((subscriptions, tasks))
 }
 fn chrono_timestamp() -> String {
     let seconds = std::time::SystemTime::now()
@@ -1261,6 +1386,7 @@ async fn stop_children(children: &mut [ManagedChild]) {
 pub(crate) async fn serve(
     config: FunctionsConfig,
     persistence: Option<Persistence>,
+    pubsub: PubSubService,
 ) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(config.addresses.functions).await?;
     let mut workers = Vec::with_capacity(config.codebases.len());
@@ -1300,7 +1426,7 @@ pub(crate) async fn serve(
     });
     HUB.set(hub.clone())
         .map_err(|_| "Functions already started")?;
-    let runtime = Runtime {
+    let mut runtime = Runtime {
         project: config.project_id,
         workers,
         client: reqwest::Client::builder()
@@ -1308,7 +1434,17 @@ pub(crate) async fn serve(
             .timeout(Duration::from_secs(60))
             .build()?,
         hub,
+        pubsub,
+        trigger_subscriptions: Vec::new(),
     };
+    let (trigger_subscriptions, trigger_tasks) = match register_pubsub_triggers(&runtime).await {
+        Ok(value) => value,
+        Err(error) => {
+            stop_children(&mut children).await;
+            return Err(error);
+        }
+    };
+    runtime.trigger_subscriptions = trigger_subscriptions;
     let queue = tokio::spawn(run_queue(runtime.clone(), rx));
     let router = control_router().fallback(proxy).with_state(runtime);
     eprintln!("Functions emulator ready on {}", config.addresses.functions);
@@ -1319,6 +1455,9 @@ pub(crate) async fn serve(
     };
     stop_children(&mut children).await;
     queue.abort();
+    for task in trigger_tasks {
+        task.abort();
+    }
     result
 }
 
@@ -1346,6 +1485,8 @@ mod tests {
                 completed: AtomicU64::new(0),
                 dispatch_hook: Mutex::new(None),
             }),
+            pubsub: PubSubService::new(None),
+            trigger_subscriptions: vec![],
         }
     }
 
@@ -1367,6 +1508,8 @@ mod tests {
                     completed: AtomicU64::new(0),
                     dispatch_hook: Mutex::new(None),
                 }),
+                pubsub: PubSubService::new(None),
+                trigger_subscriptions: vec![],
             },
             rx,
         )

@@ -42,3 +42,10 @@ credentials. Arbitrary parent-process environment variables are not propagated.
 The child environment includes local emulator hosts plus `FIREBASE_CONFIG` with
 the demo project ID, `<project>.appspot.com` bucket, and local Realtime Database
 URL. No Application Default Credentials or production configuration is read.
+In particular, every worker receives `PUBSUB_EMULATOR_HOST` with the configured
+loopback Pub/Sub address. During startup, v1 Pub/Sub exports are discovered and
+their topics and per-handler subscriptions are created before the runtime is
+reported ready. A conflicting existing trigger subscription fails startup
+explicitly. Handler success ACKs its delivery; failure leaves it for
+redelivery. This is separate from the backwards-compatible explicit Pub/Sub
+injection control route, which does not publish to the broker.
