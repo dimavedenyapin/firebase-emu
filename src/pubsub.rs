@@ -825,13 +825,15 @@ impl PubSubService {
                 let mut candidates = Vec::new();
                 {
                     let mut statement = transaction.prepare("SELECT d.message_id,m.message,m.size_bytes,d.attempts FROM pubsub_deliveries d JOIN pubsub_messages m USING(message_id) WHERE d.subscription_name=?1 AND d.state='available' ORDER BY m.published_at,m.message_id LIMIT ?2")?;
-                    let rows = statement.query_map(params![subscription,(max_count.saturating_mul(4).max(16)) as i64], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)?,row.get::<_,i32>(3)?)))?;
+                    let candidate_limit = max_count.saturating_mul(4).clamp(16, 1_000);
+                    let rows = statement.query_map(params![subscription,candidate_limit as i64], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)?,row.get::<_,i32>(3)?)))?;
                     for row in rows { candidates.push(row?); }
                 }
                 let mut result = Vec::new();
                 let mut used = 0i64;
                 for (message_id, encoded, size, attempts) in candidates {
-                    if result.len() >= max_count || used.saturating_add(size) > max_bytes { break; }
+                    if result.len() >= max_count { break; }
+                    if used.saturating_add(size) > max_bytes { continue; }
                     let ack_id = uuid::Uuid::new_v4().to_string();
                     let changed = transaction.execute("UPDATE pubsub_deliveries SET state='in_flight',ack_id=?3,deadline=?4,attempts=attempts+1 WHERE subscription_name=?1 AND message_id=?2 AND state='available'", params![subscription,message_id,ack_id,deadline])?;
                     if changed == 1 {
@@ -871,7 +873,7 @@ impl PubSubService {
                 }
                 let size = *state.message_sizes.get(&key.1).unwrap_or(&0);
                 if used.saturating_add(size) > max_bytes {
-                    break;
+                    continue;
                 }
                 let message = state
                     .messages
@@ -1700,6 +1702,42 @@ mod tests {
                 .unwrap(),
             0
         );
+
+        let bounded = PubSubService::new(None);
+        bounded
+            .create_topic_value(topic("demo-bounded", "events"))
+            .await
+            .unwrap();
+        bounded
+            .create_subscription_value(subscription("demo-bounded", "worker", "events"))
+            .await
+            .unwrap();
+        let large_id = bounded
+            .publish_values(
+                "projects/demo-bounded/topics/events",
+                vec![message(&vec![1; 1_000])],
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let small_id = bounded
+            .publish_values(
+                "projects/demo-bounded/topics/events",
+                vec![message(b"small")],
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let small = bounded
+            .claim("projects/demo-bounded/subscriptions/worker", 1, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(small[0].message.message_id, small_id);
+        let large = bounded
+            .claim("projects/demo-bounded/subscriptions/worker", 1, 2_000, None)
+            .await
+            .unwrap();
+        assert_eq!(large[0].message.message_id, large_id);
     }
 
     #[tokio::test]
