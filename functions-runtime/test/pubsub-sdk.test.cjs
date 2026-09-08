@@ -71,6 +71,72 @@ function received(subscription, action = message => message.ack(), timeout = 150
   });
 }
 
+function rawSubscriber(host) {
+  const grpc = require('@grpc/grpc-js');
+  const protoLoader = require('@grpc/proto-loader');
+  const definition = protoLoader.loadSync(path.join(repository, 'proto/google/pubsub/v1/pubsub.proto'), {
+    includeDirs: [path.join(repository, 'proto'), path.join(repository, 'functions-runtime/node_modules/google-gax/build/protos')],
+  });
+  const Subscriber = grpc.loadPackageDefinition(definition).google.pubsub.v1.Subscriber;
+  return new Subscriber(host, grpc.credentials.createInsecure());
+}
+
+function unary(client, method, request) {
+  return new Promise((resolve, reject) => client[method](request, (error, response) => error ? reject(error) : resolve(response)));
+}
+
+function nextStreamMessage(stream, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(Error('timed out waiting for StreamingPull delivery'));
+    }, timeout);
+    const onData = response => {
+      const message = response.receivedMessages?.[0];
+      if (!message) return;
+      cleanup();
+      resolve(message);
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.removeListener('data', onData);
+      stream.removeListener('error', onError);
+    };
+    stream.on('data', onData);
+    stream.on('error', onError);
+  });
+}
+
+function expectNoStreamMessage(stream, duration) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, duration);
+    const onData = response => {
+      const message = response.receivedMessages?.[0];
+      if (!message) return;
+      cleanup();
+      reject(Error(`unexpected StreamingPull delivery ${message.message?.messageId || '<unknown>'}`));
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      stream.removeListener('data', onData);
+      stream.removeListener('error', onError);
+    };
+    stream.on('data', onData);
+    stream.on('error', onError);
+  });
+}
+
 test('real @google-cloud/pubsub 4.11.0 and 2.19.4 SDK behavior', {timeout: 180000}, async t => {
   assert.ok(fs.existsSync(binary), `release binary missing: ${binary}`);
   const server = await start();
@@ -243,4 +309,77 @@ test('real process restart preserves pending and never resurrects ACKed messages
   const client = await pubsub.getClientAsync_({client: 'SubscriberClient'});
   const [empty] = await client.pull({subscription: 'projects/demo-pubsub-restart/subscriptions/restart-sub', maxMessages: 1, returnImmediately: true});
   assert.deepEqual(empty.receivedMessages || [], []);
+});
+
+test('StreamingPull reconciles broker leases at max one in memory and SQLite', {timeout: 120000}, async () => {
+  const {PubSub} = require('@google-cloud/pubsub');
+  for (const mode of ['memory', 'persistent']) {
+    const dataDir = mode === 'persistent'
+      ? fs.mkdtempSync(path.join(os.tmpdir(), 'firebase-emu-pubsub-stream-'))
+      : undefined;
+    const server = await start(dataDir);
+    process.env.PUBSUB_EMULATOR_HOST = server.host;
+    const pubsub = new PubSub({projectId: `demo-pubsub-stream-${mode}`});
+    const subscriber = rawSubscriber(server.host);
+    let stream;
+    try {
+      const [topic] = await pubsub.createTopic('lease-topic');
+      const [subscription] = await topic.createSubscription('lease-sub');
+      stream = subscriber.streamingPull();
+      const firstDelivery = nextStreamMessage(stream);
+      stream.write({
+        subscription: subscription.name,
+        streamAckDeadlineSeconds: 10,
+        maxOutstandingMessages: 1,
+        maxOutstandingBytes: 1024 * 1024,
+      });
+      const firstId = await topic.publishMessage({data: Buffer.from('expires')});
+      const first = await firstDelivery;
+      assert.equal(first.message.messageId, firstId, `${mode}: initial delivery`);
+
+      const redelivered = await nextStreamMessage(stream, 15000);
+      assert.equal(redelivered.message.messageId, firstId, `${mode}: lease expiry redelivery`);
+      assert.notEqual(redelivered.ackId, first.ackId, `${mode}: redelivery needs a new ACK ID`);
+
+      const secondDelivery = nextStreamMessage(stream, 3000);
+      await unary(subscriber, 'acknowledge', {
+        subscription: subscription.name,
+        ackIds: [redelivered.ackId],
+      });
+      const secondId = await topic.publishMessage({data: Buffer.from('extended')});
+      const second = await secondDelivery;
+      assert.equal(second.message.messageId, secondId, `${mode}: unary ACK frees stream capacity`);
+
+      await unary(subscriber, 'modifyAckDeadline', {
+        subscription: subscription.name,
+        ackIds: [second.ackId],
+        ackDeadlineSeconds: 15,
+      });
+      const thirdId = await topic.publishMessage({data: Buffer.from('after-extension')});
+      await expectNoStreamMessage(stream, 10750);
+
+      const thirdDelivery = nextStreamMessage(stream, 3000);
+      await unary(subscriber, 'acknowledge', {
+        subscription: subscription.name,
+        ackIds: [second.ackId],
+      });
+      const third = await thirdDelivery;
+      assert.equal(third.message.messageId, thirdId, `${mode}: extended lease stays outstanding until ACK`);
+      await unary(subscriber, 'acknowledge', {
+        subscription: subscription.name,
+        ackIds: [third.ackId],
+      });
+    } catch (error) {
+      throw Error(`${error.stack}\n${mode} emulator stderr:\n${server.stderr()}`);
+    } finally {
+      if (stream) {
+        stream.on('error', () => {});
+        stream.end();
+      }
+      subscriber.close();
+      await pubsub.close();
+      await server.stop();
+      if (dataDir) fs.rmSync(dataDir, {recursive: true, force: true});
+    }
+  }
 });

@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use prost::Message;
 use rusqlite::{params, OptionalExtension};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -979,6 +979,56 @@ impl PubSubService {
         Ok(())
     }
 
+    async fn active_ack_ids(
+        &self,
+        subscription: &str,
+        ack_ids: &[String],
+    ) -> Result<HashSet<String>, Status> {
+        self.get_subscription_value(subscription).await?;
+        if ack_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let requested: HashSet<_> = ack_ids.iter().cloned().collect();
+        let now = now_ms();
+        if let Some(persistence) = &self.persistence {
+            let subscription = subscription.to_owned();
+            persistence
+                .read(move |connection| {
+                    let mut statement = connection.prepare(
+                        "SELECT ack_id FROM pubsub_deliveries \
+                         WHERE subscription_name=?1 AND state='in_flight' \
+                         AND ack_id IS NOT NULL AND deadline>?2",
+                    )?;
+                    let rows = statement
+                        .query_map(params![subscription, now], |row| row.get::<_, String>(0))?;
+                    let mut active = HashSet::new();
+                    for row in rows {
+                        let ack_id = row?;
+                        if requested.contains(&ack_id) {
+                            active.insert(ack_id);
+                        }
+                    }
+                    Ok(active)
+                })
+                .await
+                .map_err(status)
+        } else {
+            let state = self.memory.lock().await;
+            Ok(state
+                .deliveries
+                .values()
+                .filter(|delivery| {
+                    delivery.subscription == subscription
+                        && delivery.state == DeliveryState::InFlight
+                        && delivery.deadline_ms.is_some_and(|deadline| deadline > now)
+                })
+                .filter_map(|delivery| delivery.ack_id.as_ref())
+                .filter(|ack_id| requested.contains(*ack_id))
+                .cloned()
+                .collect())
+        }
+    }
+
     pub(crate) async fn pending_count(&self, subscriptions: &[String]) -> Result<i64, Status> {
         if subscriptions.is_empty() {
             return Ok(0);
@@ -1400,6 +1450,17 @@ impl Subscriber for PubSubService {
                             let _ = sender.send(Err(error)).await;
                             break;
                         }
+                    }
+                }
+                // ACKs and deadline changes can arrive through unary RPCs or a
+                // different stream. Flow control must therefore count only
+                // leases that are still authoritative in the broker.
+                let ack_ids: Vec<_> = outstanding.keys().cloned().collect();
+                match service.active_ack_ids(&subscription, &ack_ids).await {
+                    Ok(active) => outstanding.retain(|ack_id, _| active.contains(ack_id)),
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
                     }
                 }
                 let used_bytes: i64 = outstanding.values().sum();
