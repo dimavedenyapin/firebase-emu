@@ -402,6 +402,24 @@ mod tests {
             )
             .unwrap();
         connection
+            .execute(
+                "INSERT INTO auth_users(namespace,uid,user_json,password) VALUES ('demo','kept-user','{\"localId\":\"kept-user\"}','hash')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO storage_objects(bucket,name,blob_name,metadata_json,generation,created,updated) VALUES ('demo.appspot.com','kept.bin','kept-blob','{}',7,'created','updated')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO event_outbox(source,payload,state,attempts,available_at) VALUES ('fixture',x'0405','pending',0,0)",
+                [],
+            )
+            .unwrap();
+        connection
             .execute_batch(
                 "DROP TABLE pubsub_deliveries;
                  DROP TABLE pubsub_messages;
@@ -412,12 +430,27 @@ mod tests {
             .unwrap();
         drop(connection);
         let persistence = Persistence::open(root.clone(), false).await.unwrap();
-        let (version, preserved, pubsub_tables) = persistence
+        let (version, firestore, auth, storage, outbox, pubsub_tables) = persistence
             .read(|connection| {
                 Ok((
                     connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
                     connection.query_row(
                         "SELECT document FROM firestore_documents WHERE name LIKE '%/items/kept'",
+                        [],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT user_json FROM auth_users WHERE namespace='demo' AND uid='kept-user'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT generation FROM storage_objects WHERE bucket='demo.appspot.com' AND name='kept.bin'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT payload FROM event_outbox WHERE source='fixture'",
                         [],
                         |row| row.get::<_, Vec<u8>>(0),
                     )?,
@@ -431,7 +464,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, 2);
-        assert_eq!(preserved, vec![1, 2, 3]);
+        assert_eq!(firestore, vec![1, 2, 3]);
+        assert_eq!(auth, r#"{"localId":"kept-user"}"#);
+        assert_eq!(storage, 7);
+        assert_eq!(outbox, vec![4, 5]);
         assert_eq!(pubsub_tables, 4);
         drop(persistence);
         fs::remove_dir_all(root).unwrap();

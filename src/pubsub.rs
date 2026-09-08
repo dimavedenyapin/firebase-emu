@@ -1850,6 +1850,15 @@ mod tests {
         assert_eq!(first.message.message_id, id);
         drop(service);
         drop(persistence);
+        let persistence = Persistence::open(root.clone(), false).await.unwrap();
+        let service = PubSubService::new(Some(persistence.clone()));
+        assert!(service
+            .pull_one("projects/demo-restart/subscriptions/worker")
+            .await
+            .unwrap()
+            .is_none());
+        drop(service);
+        drop(persistence);
         let database = root.join("firebase-emu.sqlite3");
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
@@ -1880,6 +1889,31 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        service
+            .publish_values(
+                "projects/demo-restart/topics/events",
+                vec![message(b"delete-cleanup")],
+            )
+            .await
+            .unwrap();
+        service
+            .delete_subscription_value("projects/demo-restart/subscriptions/worker")
+            .await
+            .unwrap();
+        let remaining = persistence
+            .read(|connection| {
+                Ok((
+                    connection.query_row("SELECT count(*) FROM pubsub_messages", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    connection.query_row("SELECT count(*) FROM pubsub_deliveries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, (0, 0));
         drop(service);
         drop(persistence);
         std::fs::remove_dir_all(root).unwrap();
