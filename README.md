@@ -1,6 +1,6 @@
 # Firebase emulator in Rust
 
-One loopback-only process serves Firestore gRPC and browser WebChannel (8080),
+One loopback-only process serves an embedded emulator UI (4000), Firestore gRPC and browser WebChannel (8080),
 Auth REST (9099), Storage REST (9199), Google Pub/Sub gRPC (8085), and optional
 Firebase Functions (5001). It is intended for local development and tests with
 `demo-` projects, not production traffic. The backwards-compatible default is
@@ -69,17 +69,53 @@ GCLOUD_PROJECT=demo-sdk-compat ./target/release/firebase-emu --no-functions
 
 `FIREBASE_EMU_HOST` selects a loopback IP. `FIRESTORE_EMU_PORT`,
 `FIREBASE_AUTH_EMU_PORT`, `FIREBASE_STORAGE_EMU_PORT`, and
-`PUBSUB_EMULATOR_PORT` change service ports. `--pubsub-port` overrides the
+`PUBSUB_EMULATOR_PORT` change service ports. `FIREBASE_UI_EMU_PORT` or
+`--ui-port` changes the console port; use `--ui-port 0` to let the operating
+system select a free loopback port. If a nonzero UI port is occupied, the UI
+automatically falls back to a free port and prints its resolved URL. `--no-ui`
+disables it. `--pubsub-port` overrides the
 Pub/Sub port, and `firebase.json` can configure it with normal Firebase
 conventions:
 
 ```json
 {
   "emulators": {
-    "pubsub": { "host": "127.0.0.1", "port": 8085 }
+    "pubsub": { "host": "127.0.0.1", "port": 8085 },
+    "ui": { "host": "127.0.0.1", "port": 4000 }
   }
 }
 ```
+
+## Emulator UI
+
+Open `http://127.0.0.1:4000` after startup. The UI is embedded in the executable,
+uses only the loopback services in the same process, and never discovers cloud
+credentials or production endpoints. The project selector controls all three
+views; Firestore also supports named databases.
+
+- Auth lists users and shows the complete local user record and parsed custom
+  claims.
+- Firestore uses collection, document, and field columns with breadcrumb path
+  navigation. Nested collections can be opened from their parent document.
+  Values can be edited inline while each fixed Firestore type is shown as a
+  compact subtitle beneath its field name. Invalid typed values are rejected
+  without changing the stored document.
+- Pub/Sub lists topics, topic configuration, and associated subscriptions. Its
+  inspection route reads broker metadata only: it does not pull, acknowledge,
+  nack, or change queued messages.
+
+“Copy object” places the document's `fields` map on the clipboard in
+**Firestore REST Value JSON v1** form. Every value has an explicit wrapper such
+as `integerValue` (encoded as a decimal string), `timestampValue`, `bytesValue`
+(base64), `referenceValue`, `geoPointValue`, `arrayValue`, or `mapValue`; this
+preserves Firestore types that plain JSON cannot represent safely.
+
+“Clone document” requires a destination collection path and document ID. The
+operation is atomic, preserves Firestore field types, and always uses a
+must-not-exist precondition, so it cannot overwrite an existing destination.
+Subcollections are excluded by default and can only be included with the
+separate checkbox. Object creation from an external source is intentionally not
+implemented until its source and format are specified.
 
 ## Durable local data
 
