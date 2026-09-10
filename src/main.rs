@@ -6,6 +6,7 @@ mod functions_config;
 mod persistence;
 mod pubsub;
 mod storage;
+mod ui;
 
 use std::{
     collections::BTreeMap,
@@ -32,8 +33,31 @@ fn address(port_variable: &str, default_port: u16) -> Result<SocketAddr, BoxErro
 
 async fn serve_http(addr: SocketAddr, router: axum::Router) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_http_listener(listener, router).await
+}
+
+async fn serve_http_listener(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) -> Result<(), BoxError> {
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn bind_ui_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, BoxError> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && addr.port() != 0 => {
+            let listener = tokio::net::TcpListener::bind(SocketAddr::new(addr.ip(), 0)).await?;
+            eprintln!(
+                "Emulator UI port {} is in use; selected free port {}",
+                addr.port(),
+                listener.local_addr()?.port()
+            );
+            Ok(listener)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Default)]
@@ -42,6 +66,8 @@ struct CommandLine {
     data_dir: Option<PathBuf>,
     in_memory: bool,
     no_functions: bool,
+    no_ui: bool,
+    ui_port: Option<u16>,
     functions: functions_config::ConfigOverrides,
 }
 
@@ -80,6 +106,7 @@ fn command_line() -> Result<CommandLine, BoxError> {
                 result.functions.pubsub_port =
                     Some(option_value(&mut args, "--pubsub-port")?.parse()?)
             }
+            "--ui-port" => result.ui_port = Some(option_value(&mut args, "--ui-port")?.parse()?),
             "--functions-source" => {
                 result.functions.functions_source = Some(PathBuf::from(option_value(
                     &mut args,
@@ -102,8 +129,9 @@ fn command_line() -> Result<CommandLine, BoxError> {
                 );
             }
             "--no-functions" => result.no_functions = true,
+            "--no-ui" => result.no_ui = true,
             "--help" | "-h" => {
-                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--pubsub-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions]");
+                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--pubsub-port PORT] [--ui-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions] [--no-ui]");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option `{argument}` (use --help)").into()),
@@ -193,6 +221,17 @@ async fn run() -> Result<(), BoxError> {
         .as_ref()
         .map(|config| config.project_id.as_str())
         .or(cli.functions.project.as_deref());
+    let default_project = auth_project
+        .map(str::to_owned)
+        .or_else(|| environment.get("GCLOUD_PROJECT").cloned())
+        .or_else(|| environment.get("GOOGLE_CLOUD_PROJECT").cloned())
+        .unwrap_or_else(|| "demo-rust-emu".into());
+    let ui_addr = functions_config::load_ui_address(
+        config_root.as_deref(),
+        cli.ui_port,
+        cli.functions.host.as_deref(),
+        &environment,
+    )?;
     let persistence = match cli.data_dir.clone() {
         Some(path) => {
             let path = if path.is_absolute() {
@@ -217,30 +256,66 @@ async fn run() -> Result<(), BoxError> {
     let auth_router = auth::router_for_project(auth_project, persistence.clone());
     let storage_router = storage::router(persistence.clone()).await?;
     let pubsub = pubsub::PubSubService::new(persistence.clone());
+    let firestore = firestore::FirestoreService::new(persistence.clone());
+    let ui_listener = if cli.no_ui {
+        None
+    } else {
+        Some(bind_ui_listener(ui_addr).await?)
+    };
 
     eprintln!("Firestore emulator listening on {firestore_addr}");
     eprintln!("Auth emulator listening on {auth_addr}");
     eprintln!("Storage emulator listening on {storage_addr}");
     eprintln!("Pub/Sub emulator listening on {pubsub_addr}");
+    if let Some(listener) = &ui_listener {
+        eprintln!("Emulator UI listening on http://{}", listener.local_addr()?);
+    }
     eprintln!("SDK connection: PUBSUB_EMULATOR_HOST={pubsub_addr}");
 
+    let ui_router = ui::router(ui::UiState::new(
+        default_project,
+        auth_addr,
+        firestore.clone(),
+        pubsub.clone(),
+    ));
     if let Some(config) = functions_config {
         // Every service is long-lived. A clean Functions shutdown or any service
         // failure ends the process and drops the remaining listener futures.
-        tokio::select! {
-            result = firestore::serve(firestore_addr, persistence.clone()) => result,
-            result = serve_http(auth_addr, auth_router) => result,
-            result = serve_http(storage_addr, storage_router) => result,
-            result = pubsub::serve(pubsub_addr, pubsub.clone()) => result,
-            result = functions::serve(config, persistence.clone(), pubsub) => result,
+        if let Some(listener) = ui_listener {
+            tokio::select! {
+                result = firestore::serve(firestore_addr, firestore.clone()) => result,
+                result = serve_http(auth_addr, auth_router) => result,
+                result = serve_http(storage_addr, storage_router) => result,
+                result = pubsub::serve(pubsub_addr, pubsub.clone()) => result,
+                result = functions::serve(config, persistence.clone(), pubsub) => result,
+                result = serve_http_listener(listener, ui_router) => result,
+            }
+        } else {
+            tokio::select! {
+                result = firestore::serve(firestore_addr, firestore.clone()) => result,
+                result = serve_http(auth_addr, auth_router) => result,
+                result = serve_http(storage_addr, storage_router) => result,
+                result = pubsub::serve(pubsub_addr, pubsub.clone()) => result,
+                result = functions::serve(config, persistence.clone(), pubsub) => result,
+            }
         }
     } else {
-        tokio::try_join!(
-            firestore::serve(firestore_addr, persistence.clone()),
-            serve_http(auth_addr, auth_router),
-            serve_http(storage_addr, storage_router),
-            pubsub::serve(pubsub_addr, pubsub),
-        )?;
+        if cli.no_ui {
+            tokio::try_join!(
+                firestore::serve(firestore_addr, firestore),
+                serve_http(auth_addr, auth_router),
+                serve_http(storage_addr, storage_router),
+                pubsub::serve(pubsub_addr, pubsub),
+            )?;
+        } else {
+            tokio::try_join!(
+                firestore::serve(firestore_addr, firestore),
+                serve_http(auth_addr, auth_router),
+                serve_http(storage_addr, storage_router),
+                pubsub::serve(pubsub_addr, pubsub),
+                serve_http_listener(ui_listener.expect("UI listener is bound"), ui_router),
+            )?;
+        }
         Ok(())
     }
 }
@@ -271,5 +346,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be used together"));
+    }
+
+    #[tokio::test]
+    async fn ui_listener_uses_dynamic_port_and_falls_back_from_occupied_port() {
+        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let dynamic = bind_ui_listener(SocketAddr::new(host, 0)).await.unwrap();
+        assert_ne!(dynamic.local_addr().unwrap().port(), 0);
+
+        let occupied = tokio::net::TcpListener::bind(SocketAddr::new(host, 0))
+            .await
+            .unwrap();
+        let requested = occupied.local_addr().unwrap();
+        let fallback = bind_ui_listener(requested).await.unwrap();
+        assert_ne!(fallback.local_addr().unwrap().port(), requested.port());
+        assert_eq!(fallback.local_addr().unwrap().ip(), requested.ip());
     }
 }

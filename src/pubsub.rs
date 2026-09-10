@@ -363,7 +363,7 @@ impl PubSubService {
         }
     }
 
-    async fn list_topic_values(&self, project: &str) -> Result<Vec<Topic>, Status> {
+    pub(crate) async fn list_topic_values(&self, project: &str) -> Result<Vec<Topic>, Status> {
         parse_project(project)?;
         let prefix = format!("{project}/topics/");
         if let Some(persistence) = &self.persistence {
@@ -546,7 +546,10 @@ impl PubSubService {
         }
     }
 
-    async fn list_subscription_values(&self, project: &str) -> Result<Vec<Subscription>, Status> {
+    pub(crate) async fn list_subscription_values(
+        &self,
+        project: &str,
+    ) -> Result<Vec<Subscription>, Status> {
         parse_project(project)?;
         let prefix = format!("{project}/subscriptions/");
         if let Some(persistence) = &self.persistence {

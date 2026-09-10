@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Firebase Emulator</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+  <header><div class="brand"><span class="mark">◆</span><div><strong>Firebase Emulator</strong><small>Local console</small></div></div><label>Project <input id="project" spellcheck="false"></label><button id="refresh">Refresh</button></header>
+  <div class="shell">
+    <nav><button data-view="auth">Auth</button><button class="active" data-view="firestore">Firestore</button><button data-view="pubsub">Pub/Sub</button></nav>
+    <main>
+      <div id="notice" role="status"></div>
+      <section id="auth" hidden><div class="title"><div><h1>Authentication</h1><p>Local user records and custom claims</p></div></div><div class="split"><aside><h2>Users</h2><div id="users" class="items"></div></aside><article id="userDetail" class="empty">Select a user to inspect its record.</article></div></section>
+      <section id="firestore"><div class="title"><div><h1>Firestore</h1><p id="crumbs">/(root)</p></div><label>Database <input id="database" value="(default)"></label></div><div class="firegrid"><aside><h2>Collections</h2><div id="collections" class="items"></div></aside><aside><h2>Documents</h2><div id="documents" class="items"></div></aside><article id="docDetail" class="empty">Choose a collection and document.</article></div></section>
+      <section id="pubsub" hidden><div class="title"><div><h1>Pub/Sub</h1><p>Topics and associated subscriptions (messages are not pulled)</p></div></div><div class="split"><aside><h2>Topics</h2><div id="topics" class="items"></div></aside><article id="topicDetail" class="empty">Select a topic to inspect its configuration.</article></div></section>
+    </main>
+  </div>
+  <dialog id="cloneDialog"><form method="dialog"><h2>Clone document</h2><p id="cloneSource"></p><label>Destination collection path<input id="cloneCollection" required spellcheck="false"></label><label>Document ID<input id="cloneId" required spellcheck="false"></label><label class="check"><input id="cloneChildren" type="checkbox"> Include subcollections</label><small>Subcollections are excluded by default. Existing destination documents are never overwritten.</small><div class="actions"><button value="cancel">Cancel</button><button id="cloneSubmit" value="default">Clone</button></div></form></dialog>
+  <script src="/app.js"></script>
+</body></html>

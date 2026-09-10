@@ -461,7 +461,7 @@ impl FirestoreService {
         }
     }
 
-    async fn database_documents(&self, database: &str) -> Result<Vec<Document>, Status> {
+    pub(crate) async fn database_documents(&self, database: &str) -> Result<Vec<Document>, Status> {
         if let Some(persistence) = &self.persistence {
             let database = database.to_owned();
             persistence
@@ -1106,9 +1106,8 @@ impl FirestoreService {
 
 pub async fn serve(
     addr: std::net::SocketAddr,
-    persistence: Option<crate::persistence::Persistence>,
+    service: FirestoreService,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let service = FirestoreService::new(persistence);
     let http_clear_service = service.clone();
     let grpc_routes = tonic::service::Routes::new(FirestoreServer::new(service.clone()))
         .add_service(FirestoreEmulatorServer::new(service.clone()))

@@ -581,7 +581,7 @@ fn document_proto(v: &Json) -> Result<pb::Document, Status> {
 pub(crate) fn document_json(d: &pb::Document) -> Json {
     json!({"name":d.name,"fields":d.fields.iter().map(|(k,v)|(k.clone(),value_json(v))).collect::<serde_json::Map<_,_>>(),"createTime":time_json(d.create_time.as_ref()),"updateTime":time_json(d.update_time.as_ref())})
 }
-fn value_proto(v: &Json) -> Result<pb::Value, Status> {
+pub(crate) fn value_proto(v: &Json) -> Result<pb::Value, Status> {
     use pb::value::ValueType as V;
     let value = if v.get("nullValue").is_some() {
         V::NullValue(0)

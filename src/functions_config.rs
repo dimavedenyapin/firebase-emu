@@ -341,6 +341,47 @@ pub(crate) fn load_pubsub_address(
     Ok(SocketAddr::new(host, port))
 }
 
+/// Resolve the loopback-only web UI address without requiring Functions.
+pub(crate) fn load_ui_address(
+    root: Option<&Path>,
+    cli_port: Option<u16>,
+    cli_host: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Result<SocketAddr, ConfigError> {
+    let firebase = match root {
+        Some(root) => read_optional_json(&root.join("firebase.json"))?.unwrap_or_else(|| json!({})),
+        None => json!({}),
+    };
+    let host = if let Some(host) =
+        cli_host.or_else(|| environment.get("FIREBASE_EMU_HOST").map(String::as_str))
+    {
+        parse_loopback_host(host, false)?
+    } else if let Some(host) = firebase
+        .pointer("/emulators/ui/host")
+        .and_then(Value::as_str)
+    {
+        parse_loopback_host(host, true)?
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    let file_port = firebase
+        .pointer("/emulators/ui/port")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .ok_or_else(|| -> ConfigError {
+                    "firebase.json emulator `ui` port must be an integer between 0 and 65535".into()
+                })
+        })
+        .transpose()?;
+    let port = cli_port
+        .or(env_port(environment, "FIREBASE_UI_EMU_PORT")?)
+        .or(file_port)
+        .unwrap_or(4000);
+    Ok(SocketAddr::new(host, port))
+}
+
 fn read_optional_json(path: &Path) -> Result<Option<Value>, ConfigError> {
     match fs::read_to_string(path) {
         Ok(raw) => {
@@ -775,6 +816,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overridden.to_string(), "127.0.0.1:8285");
+    }
+
+    #[test]
+    fn ui_address_uses_firebase_config_and_explicit_override() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "firebase.json",
+            r#"{"emulators":{"ui":{"host":"localhost","port":4400}}}"#,
+        );
+        let configured = load_ui_address(Some(&fixture.0), None, None, &BTreeMap::new()).unwrap();
+        assert_eq!(configured, "127.0.0.1:4400".parse().unwrap());
+        let overridden = load_ui_address(
+            Some(&fixture.0),
+            Some(4500),
+            Some("127.0.0.1"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(overridden, "127.0.0.1:4500".parse().unwrap());
+
+        let dynamic = load_ui_address(
+            Some(&fixture.0),
+            Some(0),
+            Some("127.0.0.1"),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(dynamic, "127.0.0.1:0".parse().unwrap());
+
+        let dynamic_environment = load_ui_address(
+            Some(&fixture.0),
+            None,
+            None,
+            &BTreeMap::from([("FIREBASE_UI_EMU_PORT".into(), "0".into())]),
+        )
+        .unwrap();
+        assert_eq!(dynamic_environment, "127.0.0.1:0".parse().unwrap());
+
+        fixture.write(
+            "firebase.json",
+            r#"{"emulators":{"ui":{"host":"localhost","port":0}}}"#,
+        );
+        let dynamic_file = load_ui_address(Some(&fixture.0), None, None, &BTreeMap::new()).unwrap();
+        assert_eq!(dynamic_file, "127.0.0.1:0".parse().unwrap());
     }
 
     #[test]
