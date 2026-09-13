@@ -107,7 +107,7 @@ jobs:
   release:
     name: Build, smoke, and publish five native binaries
     needs: [plan, quality]
-    if: needs.plan.outputs.release-ready == 'true'
+    if: needs.plan.outputs.release-ready == 'true' && needs.quality.result == 'success'
     permissions:
       contents: write
       id-token: write

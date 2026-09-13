@@ -136,6 +136,7 @@ class WorkflowSafetyTest(unittest.TestCase):
         self.assertIn("Create a reviewed version pull request", automatic)
         self.assertIn('gh workflow run ci.yml --ref "$branch"', automatic)
         self.assertNotIn('git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"', automatic)
+        self.assertIn("needs.quality.result == 'success'", automatic)
         self.assertIn("workflow_dispatch:", (WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
         self.assertIn("uses: ./.github/workflows/ci.yml", automatic)
         self.assertIn("uses: ./.github/workflows/release.yml", automatic)
