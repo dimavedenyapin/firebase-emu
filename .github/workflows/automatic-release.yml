@@ -18,16 +18,19 @@ jobs:
     name: Plan and record release version
     runs-on: ubuntu-24.04
     permissions:
+      actions: write
       contents: write
+      pull-requests: write
     outputs:
       ref: ${{ steps.result.outputs.ref }}
       version: ${{ steps.plan.outputs.version }}
+      release-ready: ${{ steps.result.outputs.release-ready }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.13"
       - id: plan
@@ -36,28 +39,65 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: python scripts/release-version.py plan
-      - name: Commit synchronized version manifests
+      - id: version-pr
+        name: Create a reviewed version pull request
         if: steps.plan.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ steps.plan.outputs.version }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          set -Eeuo pipefail
+          branch="automation/release-v${VERSION}-from-${SOURCE_SHA:0:12}"
+          remote_ref="refs/heads/${branch}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock package.json package-lock.json \
             functions-runtime/package.json functions-runtime/package-lock.json
           git diff --cached --check
-          git commit -m "Release v${VERSION}" \
-            -m "Firebase-Emu-Release-Source: ${SOURCE_SHA}"
-          git push origin "HEAD:refs/heads/${DEFAULT_BRANCH}"
+          if git ls-remote --exit-code --heads origin "$remote_ref" >/dev/null; then
+            git fetch origin "$remote_ref"
+            candidate="$(git rev-parse FETCH_HEAD)"
+            recorded_source="$(git log -1 --format='%(trailers:key=Firebase-Emu-Release-Source,valueonly)' "$candidate")"
+            test "$recorded_source" = "$SOURCE_SHA"
+            git diff --exit-code "$candidate" -- \
+              Cargo.toml Cargo.lock package.json package-lock.json \
+              functions-runtime/package.json functions-runtime/package-lock.json
+          else
+            git commit -m "Release v${VERSION}" \
+              -m "Firebase-Emu-Release-Source: ${SOURCE_SHA}"
+            candidate="$(git rev-parse HEAD)"
+            git push origin "$candidate:$remote_ref"
+          fi
+
+          pr="$(gh pr list --base "$DEFAULT_BRANCH" --head "$branch" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "$pr" ]]; then
+            gh pr create \
+              --base "$DEFAULT_BRANCH" \
+              --head "$branch" \
+              --title "Release v${VERSION}" \
+              --body "Automated version synchronization for source commit \`${SOURCE_SHA}\`. Review and merge this pull request only after the required CI check passes. The merge starts the normal exact-head build and release flow."
+          fi
+          gh workflow run ci.yml --ref "$branch" -f "ref=$candidate"
+          echo "ref=$candidate" >> "$GITHUB_OUTPUT"
       - id: result
-        name: Export immutable release commit
-        run: echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        name: Export immutable release state
+        env:
+          VERSION_CHANGED: ${{ steps.plan.outputs.changed }}
+        run: |
+          if [[ "$VERSION_CHANGED" = "true" ]]; then
+            echo "ref=${{ steps.version-pr.outputs.ref }}" >> "$GITHUB_OUTPUT"
+            echo "release-ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "release-ready=true" >> "$GITHUB_OUTPUT"
+          fi
 
   quality:
     name: Required CI gates
     needs: plan
+    if: needs.plan.outputs.release-ready == 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
@@ -67,8 +107,11 @@ jobs:
   release:
     name: Build, smoke, and publish five native binaries
     needs: [plan, quality]
+    if: needs.plan.outputs.release-ready == 'true' && needs.quality.result == 'success'
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/release.yml
     with:
       ref: ${{ needs.plan.outputs.ref }}

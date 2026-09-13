@@ -14,8 +14,9 @@ excluded from emulator totals.
 
 ## Reproduce (isolated ports 18280/18299/18399/18401)
 
+Run from the repository root:
+
 ```sh
-cd /path/to/firebase-emu
 python3 scripts/bench/measure.py --mode no-functions --idle-seconds 10 --out /tmp/bench-nofunc.jsonl --label idle-no-functions
 python3 scripts/bench/measure.py --mode functions --idle-seconds 15 --out /tmp/bench-func-idle.jsonl --label idle-functions
 python3 scripts/bench/measure.py --mode functions --workload "node scripts/bench/workload.mjs" --out /tmp/bench-load.jsonl --label load
@@ -28,6 +29,7 @@ python3 scripts/bench/measure.py --mode functions --data-dir "/tmp/firebase emu 
 runs the optional workload as a separate process, keeps a 5 s
 retained-memory tail, then SIGTERMs only its own process group and
 confirms the ports are free. It never touches unrelated processes.
+The database and Pub/Sub channels use free loopback ports selected at runtime.
 
 CPU convention: macOS `ps %CPU`, 100% = one logical core.
 Tree RSS sums per-process RSS; shared pages are double-counted.

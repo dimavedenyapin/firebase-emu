@@ -1127,7 +1127,10 @@ pub async fn serve(
                     }
                 }
             }),
-        );
+        )
+        .layer(axum07::middleware::from_fn(
+            crate::http_security::require_loopback_request_axum07,
+        ));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum07::serve(listener, routes).await?;
     Ok(())

@@ -1,0 +1,18 @@
+name: Bug report
+description: Report a reproducible beta problem
+title: "[Bug] "
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Release, OS, architecture, Node and SDK versions
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Small demo-project example, expected result, actual result and logs without secrets
+    validations:
+      required: true

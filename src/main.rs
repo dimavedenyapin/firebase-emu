@@ -3,6 +3,7 @@ mod firestore;
 mod firestore_web;
 mod functions;
 mod functions_config;
+mod http_security;
 mod persistence;
 mod pubsub;
 mod storage;
@@ -33,7 +34,13 @@ fn address(port_variable: &str, default_port: u16) -> Result<SocketAddr, BoxErro
 
 async fn serve_http(addr: SocketAddr, router: axum::Router) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_http_listener(listener, router).await
+    serve_http_listener(
+        listener,
+        router.layer(axum::middleware::from_fn(
+            http_security::require_loopback_request,
+        )),
+    )
+    .await
 }
 
 async fn serve_http_listener(
