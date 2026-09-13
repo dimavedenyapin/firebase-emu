@@ -3,6 +3,7 @@ name = "firebase-emu"
 version = "0.1.5"
 edition = "2021"
 license = "Apache-2.0"
+description = "FireRust local emulator for Firestore, Auth, Storage, Pub/Sub, and Firebase Functions"
 
 [dependencies]
 axum = "0.8"

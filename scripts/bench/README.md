@@ -1,4 +1,4 @@
-# Emulator resource benchmark
+# FireRust resource benchmark
 
 Small reusable harness. Measures the running emulator processes only,
 never build/compiler usage. Workload generator is tracked separately and

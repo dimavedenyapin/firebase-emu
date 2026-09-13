@@ -1,6 +1,6 @@
-# Beta compatibility
+# FireRust beta compatibility
 
-Tested behavior is narrower than the complete Firebase API. Use the official
+FireRust tested behavior is narrower than the complete Firebase API. Use the official
 emulators for Security Rules and unsupported features. No production parity is promised.
 
 | Service | Supported beta paths | Main limits |

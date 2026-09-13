@@ -58,7 +58,8 @@ pub(crate) fn router(state: UiState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(script))
         .route("/style.css", get(style))
-        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/firerust-logo.png", get(logo))
+        .route("/favicon.ico", get(logo))
         .route("/api/config", get(config))
         .route("/api/auth/users", get(auth_users))
         .route("/api/firestore/documents", get(firestore_documents))
@@ -97,7 +98,7 @@ async fn console_boundary(request: AxumRequest, next: Next) -> Response {
 fn secure_console_response(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -120,6 +121,13 @@ async fn style() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("ui/style.css"),
+    )
+        .into_response()
+}
+async fn logo() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../docs/images/firerust-logo.png").as_slice(),
     )
         .into_response()
 }
@@ -489,7 +497,34 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("Firestore"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("<title>FireRust Console</title>"));
+        assert!(body.contains("alt=\"FireRust flame and crab logo\""));
+        assert!(body.contains("Local Firebase emulator console"));
+        for uri in ["/firerust-logo.png", "/favicon.ico"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .header("host", "127.0.0.1:4000")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+            assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("img-src 'self'"));
+            let logo = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                logo.as_ref(),
+                include_bytes!("../docs/images/firerust-logo.png")
+            );
+        }
         for uri in [
             "/api/firestore/documents?project=demo-ui",
             "/api/pubsub?project=demo-ui",

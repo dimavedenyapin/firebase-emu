@@ -1,4 +1,4 @@
-# Browser test scope
+# FireRust browser test scope
 
 All 15 required browser checks must pass on Google and Rust. Two validate
 generic synthetic input without contacting an emulator. The remaining 13 cover Auth

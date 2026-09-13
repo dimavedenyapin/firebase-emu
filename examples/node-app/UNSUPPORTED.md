@@ -1,4 +1,4 @@
-# Test scope
+# FireRust Node test scope
 
 All 19 required Node SDK checks must pass on Google and Rust. The listener check includes a live update. No required operation is skipped.
 

@@ -1,9 +1,10 @@
-# Recorded resource measurements
+# FireRust recorded resource measurements
 
-These historical results were collected before the public beta preparation.
-They measure v0.1.3, not the current launch branch. Decimal MB = 1,000,000 bytes.
+These historical results were collected before the FireRust rebrand and public
+beta preparation. They measure v0.1.3, not the current source branch or a new
+FireRust release. Decimal MB = 1,000,000 bytes.
 
-| Emulator process tree | Rust v0.1.3 | Official suite |
+| Emulator process tree | FireRust code at v0.1.3 | Official suite |
 | --- | ---: | ---: |
 | Idle RSS, range across runs | 68.1–68.2 MB | 735.3–781.7 MB |
 | Peak RSS under load, range across runs | 110.2–110.6 MB | 2,345.6–2,435.9 MB |

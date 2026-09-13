@@ -1,21 +1,38 @@
-# Firebase emulator in Rust
+# FireRust
 
-A local Firebase emulator for development and automated tests. One Rust process
-serves Firestore, Auth, Storage, Pub/Sub, and a browser console. An optional Node
-worker runs Firebase Functions. Local data can remain in memory or persist in SQLite.
+<p align="center">
+  <img src="docs/images/firerust-logo.png" width="320" alt="FireRust flame and crab logo">
+</p>
+
+FireRust is a local Firebase emulator for development and automated tests. One
+Rust process serves Firestore, Auth, Storage, Pub/Sub, and a browser console. An
+optional Node worker runs Firebase Functions. Local data can remain in memory or
+persist in SQLite.
+
+The FireRust name is the user-facing project identity. The repository, package,
+crate, executable, and command keep their existing `firebase-emu` names for
+compatibility. Existing install commands, environment variables, data directories,
+protocol identifiers, and release URLs do not change.
 
 **Public beta.** This independent project is not affiliated with Google. Security
 Rules and production transaction isolation are not implemented. Use synthetic data
 and `demo-` projects. Passing a test here does not prove production compatibility.
+
+The performance goal remains important. In the historical v0.1.3 comparison,
+idle process-tree RSS was **68.1–68.2 MB** for this Rust implementation and
+**735.3–781.7 MB** for the official suite. FireRust used SQLite storage, the
+official suite used memory storage, and summed RSS can count shared pages more
+than once. These results are not a speed or current-release guarantee. See the
+[full benchmark conditions](docs/BENCHMARKS.md).
 
 [Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md) ·
 [Minimal example](examples/quickstart/README.md) ·
 [Troubleshooting](docs/TROUBLESHOOTING.md) · [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md) · [Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
 
-## Quickstart (v0.1.5)
+## Quickstart (published v0.1.5)
 
-After v0.1.5 is published, run its binary with Node 22. No Rust install is needed:
+Run the published v0.1.5 binary with Node 22. No Rust install is needed:
 
 ```sh
 npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
@@ -26,6 +43,10 @@ synthetic data only. See [Compatibility](docs/COMPATIBILITY.md) for the beta
 scope and [Benchmarks](docs/BENCHMARKS.md) for recorded resource measurements.
 The benchmark figures are historical v0.1.3 results, not v0.1.5 guarantees.
 Then run the [minimal synthetic-data example](examples/quickstart/README.md).
+
+The FireRust rebrand is newer than published v0.1.5. That release can still show
+the earlier console name. This source branch changes branding only and does not
+replace, republish, or rename the v0.1.5 assets.
 
 ## Install and run
 
@@ -79,7 +100,7 @@ conventions:
 }
 ```
 
-## Emulator UI
+## FireRust console
 
 Use the resolved URL printed at startup when you select `--ui-port 0`.
 
@@ -94,9 +115,13 @@ views; Firestore also supports named databases.
 
 ![Pub/Sub console with a separate synthetic topic](docs/images/console-pubsub.png)
 
-The screenshots use synthetic local data. They came from a local build of
-`v0.1.4`, before the public-beta security changes. The Pub/Sub image uses a
-separate synthetic topic setup; the quickstart seed does not create a topic.
+<p align="center">
+  <img src="docs/images/console-mobile.png" width="390" alt="FireRust Pub/Sub console at a mobile viewport width">
+</p>
+
+The screenshots use synthetic local data and the FireRust source branch. They
+are not screenshots of published v0.1.5. The Pub/Sub image uses a separate
+synthetic topic setup; the quickstart seed does not create a topic.
 
 - Auth lists users and shows the complete local user record and parsed custom
   claims.

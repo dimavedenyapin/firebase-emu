@@ -1,4 +1,4 @@
-# Node.js SDK compatibility app
+# FireRust Node.js SDK compatibility app
 
 This synthetic ESM example exercises locked public SDK releases through their
 supported entry points: Firebase Admin 11.11.1, direct Google Cloud Firestore

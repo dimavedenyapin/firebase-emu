@@ -1,4 +1,4 @@
-# Contributing
+# Contributing to FireRust
 
 Open an issue for a proposed API or behavior change. Describe the SDK call, expected
 behavior and a small reproduction with synthetic data. Report vulnerabilities privately

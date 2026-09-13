@@ -1,7 +1,7 @@
-# Troubleshooting
+# FireRust troubleshooting
 
 This page does not need a private Peakflo application. It covers only the public
-beta emulator and the examples in this repository: the
+FireRust beta and the examples in this repository: the
 [minimal example](../examples/quickstart/README.md), the
 [Node example](../examples/node-app/README.md), and the
 [web example](../examples/web-app/README.md).

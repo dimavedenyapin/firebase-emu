@@ -1,4 +1,4 @@
-# Security policy
+# FireRust security policy
 
 ## Report a vulnerability
 

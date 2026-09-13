@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.1.5 — pending publication
+## Unreleased
+
+- Adopt the FireRust user-facing name and supplied logo in the README and embedded console.
+- Keep the `firebase-emu` command, package/crate names, repository URL, environment
+  variables, data formats, and release paths compatible.
+
+## 0.1.5 — 2026-09-13
 
 - Prepare public beta documentation, historical benchmark disclosure and support files.
 - Add security and release acceptance controls. See the launch report for validation.

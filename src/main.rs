@@ -57,7 +57,7 @@ async fn bind_ui_listener(addr: SocketAddr) -> Result<tokio::net::TcpListener, B
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && addr.port() != 0 => {
             let listener = tokio::net::TcpListener::bind(SocketAddr::new(addr.ip(), 0)).await?;
             eprintln!(
-                "Emulator UI port {} is in use; selected free port {}",
+                "FireRust console port {} is in use; selected free port {}",
                 addr.port(),
                 listener.local_addr()?.port()
             );
@@ -138,7 +138,7 @@ fn command_line() -> Result<CommandLine, BoxError> {
             "--no-functions" => result.no_functions = true,
             "--no-ui" => result.no_ui = true,
             "--help" | "-h" => {
-                println!("firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--pubsub-port PORT] [--ui-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions] [--no-ui]");
+                println!("FireRust local Firebase emulator\n\nUsage: firebase-emu [--data-dir PATH | --in-memory] [--config DIR] [--project demo-ID] [--host LOOPBACK] [--functions-port PORT] [--pubsub-port PORT] [--ui-port PORT] [--functions-source DIR] [--functions-codebase NAME] [--functions-runtime nodejs18|nodejs20|nodejs22] [--runtime-config JSON] [--no-functions] [--no-ui]");
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option `{argument}` (use --help)").into()),
@@ -188,7 +188,7 @@ fn configured_root(cli: &CommandLine) -> Result<Option<PathBuf>, BoxError> {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("firebase-emu: {error}");
+        eprintln!("FireRust (firebase-emu): {error}");
         std::process::exit(1);
     }
 }
@@ -275,7 +275,10 @@ async fn run() -> Result<(), BoxError> {
     eprintln!("Storage emulator listening on {storage_addr}");
     eprintln!("Pub/Sub emulator listening on {pubsub_addr}");
     if let Some(listener) = &ui_listener {
-        eprintln!("Emulator UI listening on http://{}", listener.local_addr()?);
+        eprintln!(
+            "FireRust console listening on http://{}",
+            listener.local_addr()?
+        );
     }
     eprintln!("SDK connection: PUBSUB_EMULATOR_HOST={pubsub_addr}");
 

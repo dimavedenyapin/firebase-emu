@@ -118,6 +118,7 @@ jobs:
           python scripts/package-release-smoke.py
           --archive "dist/firebase-emu-v${{ needs.metadata.outputs.version }}-${{ matrix.target }}${{ endsWith(matrix.target, 'windows-msvc') && '.zip' || '.tar.gz' }}"
           --repository "$GITHUB_WORKSPACE"
+          --require-firerust-brand
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: firebase-emu-${{ matrix.target }}

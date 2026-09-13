@@ -1,6 +1,7 @@
-# Firebase browser demo
+# FireRust browser demo
 
-This synthetic React 16 app uses Firebase 12.12.1 directly against loopback
+This synthetic React 16 app uses Firebase 12.12.1 directly against FireRust on
+loopback
 emulators. It contains no application or customer code.
 
 Its strict result has 15 assertions: 13 emulator operations plus two generic

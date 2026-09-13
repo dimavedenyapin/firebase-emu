@@ -284,6 +284,22 @@ def smoke(args: argparse.Namespace) -> None:
             status, console = http_status(f"http://127.0.0.1:{ui}/")
             if status != 200 or b"Firestore" not in console:
                 raise RuntimeError("packaged console did not load")
+            if args.require_firerust_brand:
+                if (
+                    b"<title>FireRust Console</title>" not in console
+                    or b'img src="/firerust-logo.png"' not in console
+                ):
+                    raise RuntimeError("packaged FireRust console did not load")
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{ui}/firerust-logo.png", timeout=5
+                ) as logo_response:
+                    logo = logo_response.read()
+                    content_type = logo_response.headers.get_content_type()
+                    policy = logo_response.headers.get("content-security-policy", "")
+                if content_type != "image/png" or not logo.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise RuntimeError("packaged FireRust logo is not a PNG response")
+                if "img-src 'self'" not in policy:
+                    raise RuntimeError("packaged FireRust logo response has no image CSP")
             status, config = http_status(f"http://127.0.0.1:{ui}/api/config")
             if status != 200 or "defaultProject" not in json.loads(config):
                 raise RuntimeError("packaged console config failed")
@@ -452,6 +468,7 @@ def main() -> None:
     parser.add_argument("--archive", required=True, type=Path)
     parser.add_argument("--repository", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--node", type=Path)
+    parser.add_argument("--require-firerust-brand", action="store_true")
     smoke(parser.parse_args())
 
 
