@@ -6,90 +6,94 @@
 
 FireRust is a local Firebase emulator for development and automated tests. One
 Rust process serves Firestore, Auth, Storage, Pub/Sub, and a browser console. An
-optional Node worker runs Firebase Functions. Local data can remain in memory or
-persist in SQLite.
+optional Node worker runs Firebase Functions. You can keep local data in memory
+or save it in SQLite.
 
-The FireRust name is the user-facing project identity. The repository, package,
-crate, executable, and command keep their existing `firebase-emu` names for
-compatibility. Existing install commands, environment variables, data directories,
-protocol identifiers, and release URLs do not change.
+FireRust is the user-facing project name. The executable and command remain
+`firebase-emu` for compatibility. The repository, package, crate, environment
+variables, data formats, protocol identifiers, and release URLs also keep their
+existing names.
 
-**Public beta.** This independent project is not affiliated with Google. Security
-Rules and production transaction isolation are not implemented. Use synthetic data
-and `demo-` projects. Passing a test here does not prove production compatibility.
+**Public beta:** FireRust is an independent project. It is not affiliated with
+Google. It does not implement Security Rules or production transaction
+isolation. Use synthetic data and `demo-` projects. A successful local test
+does not prove production compatibility.
 
-The performance goal remains important. In the historical v0.1.3 comparison,
-idle process-tree RSS was **68.1–68.2 MB** for this Rust implementation and
-**735.3–781.7 MB** for the official suite. FireRust used SQLite storage, the
-official suite used memory storage, and summed RSS can count shared pages more
-than once. These results are not a speed or current-release guarantee. See the
-[full benchmark conditions](docs/BENCHMARKS.md).
+Lower memory use is an important goal. In a historical v0.1.3 comparison, the
+idle process-tree RSS was **68.1–68.2 MB** for the Rust emulator and
+**735.3–781.7 MB** for the official suite. The Rust test used SQLite storage.
+The official test used memory storage. Summed RSS can count shared pages more
+than once. These results do not describe startup time, speed, or the current
+release. Read the [benchmark method and limits](docs/BENCHMARKS.md).
 
 [Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md) ·
 [Minimal example](examples/quickstart/README.md) ·
 [Troubleshooting](docs/TROUBLESHOOTING.md) · [Contributing](CONTRIBUTING.md) ·
-[Security](SECURITY.md) · [Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
+[Security](SECURITY.md) ·
+[Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
 
-## Quickstart (published v0.1.5)
+## Quickstart
 
-Run the published v0.1.5 binary with Node 22. No Rust install is needed:
+The current published release is v0.1.5. Run it with Node 22. You do not need
+Rust.
 
 ```sh
 npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
 ```
 
-Open the resolved loopback URL printed at startup. Use a `demo-` project and
-synthetic data only. See [Compatibility](docs/COMPATIBILITY.md) for the beta
-scope and [Benchmarks](docs/BENCHMARKS.md) for recorded resource measurements.
-The benchmark figures are historical v0.1.3 results, not v0.1.5 guarantees.
-Then run the [minimal synthetic-data example](examples/quickstart/README.md).
+Open the loopback URL that FireRust prints at startup. Use synthetic data only.
+Then run the [minimal example](examples/quickstart/README.md).
 
-The FireRust rebrand is newer than published v0.1.5. That release can still show
-the earlier console name. This source branch changes branding only and does not
-replace, republish, or rename the v0.1.5 assets.
+The FireRust rebrand is newer than v0.1.5. The published v0.1.5 console can show
+the earlier name. This source revision does not replace or republish v0.1.5.
 
 ## Install and run
 
-Release archives are built and smoke-tested natively for:
+Release archives have native smoke tests for these systems:
 
-- macOS 15 on Intel (`x86_64-apple-darwin`) and Apple Silicon
-  (`aarch64-apple-darwin`)
-- Ubuntu 24.04 with glibc 2.39 on x64 (`x86_64-unknown-linux-gnu`) and
-  arm64 (`aarch64-unknown-linux-gnu`)
+- macOS 15 on Intel (`x86_64-apple-darwin`)
+- macOS 15 on Apple Silicon (`aarch64-apple-darwin`)
+- Ubuntu 24.04 with glibc 2.39 on x64
+  (`x86_64-unknown-linux-gnu`)
+- Ubuntu 24.04 with glibc 2.39 on arm64
+  (`aarch64-unknown-linux-gnu`)
 - Windows Server 2022 x64 (`x86_64-pc-windows-msvc`)
 
-Those are tested baselines, not claims of compatibility with older operating
-system or libc versions. The supported runnable path uses Node 22, as shown in
-[Quickstart](#quickstart-v015).
+These systems are the tested baselines. Compatibility with older operating
+systems or libc versions is not guaranteed.
 
-Use Node 22 to run the published binary without installing Rust:
+Use the [Quickstart](#quickstart) command to run the published binary. The
+launcher downloads the matching public GitHub Release archive. It verifies
+the archive against the release SHA-256 manifest. It caches the archive by
+version and target. It then forwards the command arguments without shell
+interpolation.
 
-```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
-```
+There is no published npm-registry package. Therefore,
+`npx firebase-emu-rs` is not a supported installation command. Use the GitHub
+URL in the command above.
 
-The launcher downloads the matching public GitHub Release archive, verifies it
-against the release SHA-256 manifest, caches it per version and target, and
-then forwards arguments without shell interpolation. An npm-registry package
-has not been published, so `npx firebase-emu-rs` is not currently an npm
-installation path; the GitHub URL above is the supported `npx` relationship.
-
-Build from source with stable Rust when developing:
+Use stable Rust to build from source:
 
 ```sh
 cargo build --locked --release
 GCLOUD_PROJECT=demo-sdk-compat ./target/release/firebase-emu --no-functions
 ```
 
-`FIREBASE_EMU_HOST` selects a loopback IP. `FIRESTORE_EMU_PORT`,
-`FIREBASE_AUTH_EMU_PORT`, `FIREBASE_STORAGE_EMU_PORT`, and
-`PUBSUB_EMULATOR_PORT` change service ports. `FIREBASE_UI_EMU_PORT` or
-`--ui-port` changes the console port; use `--ui-port 0` to let the operating
-system select a free loopback port. If a nonzero UI port is occupied, the UI
-automatically falls back to a free port and prints its resolved URL. `--no-ui`
-disables it. `--pubsub-port` overrides the
-Pub/Sub port, and `firebase.json` can configure it with normal Firebase
-conventions:
+Use these environment variables to change the listeners:
+
+- `FIREBASE_EMU_HOST` selects a loopback IP address.
+- `FIRESTORE_EMU_PORT` changes the Firestore port.
+- `FIREBASE_AUTH_EMU_PORT` changes the Auth port.
+- `FIREBASE_STORAGE_EMU_PORT` changes the Storage port.
+- `PUBSUB_EMULATOR_PORT` changes the Pub/Sub port.
+- `FIREBASE_UI_EMU_PORT` changes the console port.
+
+You can also use `--ui-port` and `--pubsub-port`. Use `--ui-port 0` to
+select a free loopback port. If a selected nonzero UI port is in use, FireRust
+selects a free port and prints the new URL. Use `--no-ui` to disable the
+console.
+
+You can set the Pub/Sub and console ports in `firebase.json`:
 
 ```json
 {
@@ -102,12 +106,15 @@ conventions:
 
 ## FireRust console
 
-Use the resolved URL printed at startup when you select `--ui-port 0`.
+If you use `--ui-port 0`, open the URL that FireRust prints. The default URL
+is `http://127.0.0.1:4000`.
 
-Open `http://127.0.0.1:4000` after startup. The UI is embedded in the executable,
-uses only the loopback services in the same process, and never discovers cloud
-credentials or production endpoints. The project selector controls all three
-views; Firestore also supports named databases.
+The console is embedded in the executable. It connects only to loopback
+services in the same process. It does not discover cloud credentials or
+production endpoints.
+
+The project selector controls the Auth, Firestore, and Pub/Sub views. The
+Firestore view also supports named databases.
 
 ![Auth console with a synthetic local user](docs/images/console-auth.png)
 
@@ -119,108 +126,137 @@ views; Firestore also supports named databases.
   <img src="docs/images/console-mobile.png" width="390" alt="FireRust Pub/Sub console at a mobile viewport width">
 </p>
 
-The screenshots use synthetic local data and the FireRust source branch. They
-are not screenshots of published v0.1.5. The Pub/Sub image uses a separate
-synthetic topic setup; the quickstart seed does not create a topic.
+These screenshots use synthetic local data and FireRust source. They do not
+show published v0.1.5. The Pub/Sub screenshot uses a separate synthetic topic.
+The quickstart seed does not create a topic.
 
-- Auth lists users and shows the complete local user record and parsed custom
-  claims.
-- Firestore uses collection, document, and field columns with breadcrumb path
-  navigation. Nested collections can be opened from their parent document.
-  Values can be edited inline while each fixed Firestore type is shown as a
-  compact subtitle beneath its field name. Invalid typed values are rejected
-  without changing the stored document.
-- Pub/Sub lists topics, topic configuration, and associated subscriptions. Its
-  inspection route reads broker metadata only: it does not pull, acknowledge,
-  nack, or change queued messages.
+The Auth view lists users. It shows the complete local user record and parsed
+custom claims.
 
-“Copy object” places the document's `fields` map on the clipboard in
-**Firestore REST Value JSON v1** form. Every value has an explicit wrapper such
-as `integerValue` (encoded as a decimal string), `timestampValue`, `bytesValue`
-(base64), `referenceValue`, `geoPointValue`, `arrayValue`, or `mapValue`; this
-preserves Firestore types that plain JSON cannot represent safely.
+The Firestore view has collection, document, and field columns. Breadcrumbs
+show the current path. You can open a nested collection from its parent
+document. You can edit values inline. Each fixed Firestore type appears below
+its field name. An invalid value does not change the document.
 
-“Clone document” requires a destination collection path and document ID. The
-operation is atomic, preserves Firestore field types, and always uses a
-must-not-exist precondition, so it cannot overwrite an existing destination.
-Subcollections are excluded by default and can only be included with the
-separate checkbox. Import from an external object source is outside the beta scope.
+The Pub/Sub view lists topics, topic settings, and subscriptions. It reads
+broker metadata only. It does not pull, acknowledge, reject, or change queued
+messages.
+
+**Copy object** copies the document `fields` map as Firestore REST Value JSON
+v1. Each value has an explicit type wrapper. Examples include
+`integerValue`, `timestampValue`, `bytesValue`, `referenceValue`,
+`geoPointValue`, `arrayValue`, and `mapValue`. This format preserves types
+that plain JSON cannot safely represent.
+
+**Clone document** requires a destination collection path and document ID. The
+operation is atomic. It preserves Firestore field types. It uses a
+must-not-exist precondition and cannot overwrite an existing document.
+Subcollections are not included by default. Select the separate checkbox to
+include them. Import from an external object source is not in the beta scope.
 
 ## Durable local data
 
-No option, or the explicit `--in-memory` option, preserves the historical
-ephemeral behavior. Use a dedicated directory to retain acknowledged data:
+FireRust uses memory storage by default. The explicit `--in-memory` option has
+the same behavior.
+
+Use `--data-dir` to keep acknowledged data:
 
 ```sh
 firebase-emu --data-dir "./.firebase-emu-data" --no-functions
 firebase-emu --data-dir "./local data/firebase" --no-functions
 ```
 
-Persistence is available in v0.1.5. The GitHub launcher accepts these arguments.
+Persistence is available in v0.1.5. The GitHub launcher accepts these
+arguments.
 
-`--data-dir` and `--in-memory` conflict and are rejected. Relative data paths
-resolve from the process working directory, independently of `--config`; the
-startup log prints the canonical SQLite and object paths. The GitHub `npx`
-launcher forwards options directly, so do not insert an extra `--`. No custom
-field is read from `firebase.json`.
+Do not use `--data-dir` with `--in-memory`. FireRust rejects this
+combination. A relative data path starts at the process working directory. It
+does not start at the `--config` directory. The startup log prints the
+canonical SQLite and object paths.
 
-The directory contains `firebase-emu.sqlite3` in SQLite WAL mode, an exclusive
-owner lock, opaque object files under `blobs/`, and crash-recovery files under
-`tmp/`. SQLite is compiled into every release binary; no database server or
-installed SQLite library is required. Firestore protobufs are stored without a
-JSON conversion, preserving 64-bit integers, timestamps, bytes, references,
-geopoints, nested values, NaN, full resource names, and document timestamps.
-Auth users, password material, custom claims, ID/refresh sessions, revocation
-state, Storage metadata, and Pub/Sub topics, subscriptions, messages, delivery
-leases, and acknowledgements are durable. Active Firestore transaction handles,
-open HTTP requests, sockets, and incomplete resumable uploads are process-local.
-Opening an existing schema-v1 data directory performs a transactional migration
-to schema v2 without replacing its Firestore, Auth, Storage, or Functions outbox
-data.
+Do not add an extra `--` to the GitHub `npx` command. The launcher forwards
+options directly. FireRust does not read a custom data-directory field from
+`firebase.json`.
 
-One bounded 128-entry writer queue serializes SQLite transactions on a
-dedicated OS thread. Up to eight blocking read connections can run
-concurrently; every connection has a 5-second busy timeout and an 8 MiB SQLite
-page-cache target. Acknowledged writes use WAL with `synchronous=FULL`.
-Persistent queries narrow in SQLite and then reuse the existing Rust query
-evaluator, so complex queries remain scans and hold only their transient result
-set in memory—there is no unbounded full database mirror or result cache.
+The data directory contains these items:
 
-Storage finalization flushes a unique temporary blob, renames it to an
-immutable opaque UUID name, then commits metadata and its event. Overwrite and
-delete cleanup occurs only after that commit. Startup discards incomplete temp
-files and unreferenced blobs; a missing referenced blob or corrupt/newer schema
-stops startup instead of resetting data. A retained exclusive lock rejects a
-second process using the same directory.
+- `firebase-emu.sqlite3` in SQLite WAL mode
+- an exclusive owner lock
+- opaque object files in `blobs/`
+- crash-recovery files in `tmp/`
+
+SQLite is compiled into each release binary. You do not need a database server
+or an installed SQLite library.
+
+Firestore protobufs are stored without JSON conversion. This preserves 64-bit
+integers, timestamps, bytes, references, geopoints, nested values, NaN values,
+full resource names, and document timestamps.
+
+FireRust stores Auth users, password material, custom claims, ID and refresh
+sessions, revocation state, and Storage metadata. It also stores Pub/Sub
+topics, subscriptions, messages, delivery leases, and acknowledgements.
+
+Active Firestore transaction handles remain in the process. Open HTTP
+requests, sockets, and incomplete resumable uploads also remain in the
+process. FireRust migrates a schema-v1 directory to schema v2 in one
+transaction. The migration keeps existing Firestore, Auth, Storage, and
+Functions outbox data.
+
+A bounded 128-entry writer queue serializes SQLite transactions on one
+dedicated operating-system thread. Up to eight read connections can run at
+the same time. Each connection has a 5-second busy timeout and an 8 MiB page
+cache target. Acknowledged writes use WAL with `synchronous=FULL`.
+
+Persistent queries first narrow the result in SQLite. They then use the Rust
+query evaluator. Complex queries remain scans. FireRust keeps only the
+temporary result set in memory. It does not keep an unbounded database mirror
+or result cache.
+
+Storage finalization flushes a unique temporary blob. It renames the blob to an
+opaque UUID name. It then commits the metadata and event. Overwrite and delete
+cleanup starts only after this commit.
+
+At startup, FireRust removes incomplete temporary files and unreferenced
+blobs. A missing referenced blob stops startup. A corrupt or newer schema also
+stops startup. FireRust does not reset the data. The exclusive lock prevents a
+second process from using the same directory.
 
 Supported Firestore and Storage triggers use a durable outbox when Functions
-are configured. Pending/in-flight work is recovered after restart, stable event
-IDs are retried up to five times with bounded backoff, and terminal failures are
-reported by Functions status/drain. Failed durable state transitions are
-retried immediately, and an expired five-second delivery lease is reclaimable
-without restarting the process. Direct Pub/Sub/schedule work is checked after
-each burst of at most 32 durable deliveries; queued wake notifications are
-coalesced at that boundary. A 10 ms pause between full bursts bounds sustained
-durable dispatch rate without dropping or failing events. Consequently, a
-self-triggering function remains pending and rate-limited until its cause is
-removed or the process is stopped; drain will not complete while it continues.
-Delivery is at least once: a crash after a
-handler succeeds but before its durable acknowledgement can deliver the same
-event ID again, and one source event targeting several handlers can repeat the
-whole matching group. Exactly-once delivery is not promised. Starting with
-`--no-functions` retains existing pending work without delivering it.
+are configured. FireRust recovers pending and in-flight work after restart. It
+retries each stable event ID up to five times with bounded backoff. Functions
+status and drain report terminal failures.
 
-The existing Firestore ClearData API durably resets only its requested
-project/database and does not emit create events during restart rehydration.
-There is no automatic reset, import, or seed. To reset every service, stop the
-owner and remove that one explicitly selected data directory. For backup, stop
-the emulator before copying the whole directory (database, any `-wal`/`-shm`,
-and `blobs/`); copying only a live main database file is not a valid backup.
+FireRust immediately retries a failed durable state transition. It can reclaim
+an expired five-second delivery lease without a restart. It checks direct
+Pub/Sub and schedule work after each burst of 32 or fewer durable deliveries.
+It combines queued wake notifications at this boundary. A 10 ms pause between
+full bursts limits the sustained dispatch rate without dropping events.
+
+A self-triggering function remains pending and rate-limited. It stays in this
+state until you remove the cause or stop the process. Drain cannot complete
+while the function continues.
+
+Delivery is at least once. A crash can occur after a handler succeeds but
+before the durable acknowledgement. FireRust can then deliver the same event
+ID again. If one source event targets several handlers, FireRust can repeat the
+complete matching group. FireRust does not promise exactly-once delivery.
+`--no-functions` keeps pending work but does not deliver it.
+
+The Firestore ClearData API resets only the requested project and database. It
+does not create events during restart recovery. FireRust does not reset,
+import, or seed data automatically.
+
+To reset all services, stop the process. Then remove only the data directory
+that you selected. To make a backup, first stop the emulator. Copy the complete
+directory, including the database, `-wal` and `-shm` files, and `blobs/`.
+Do not copy only a live main database file.
 
 ## Functions runtime
 
-Functions stay disabled unless Firebase configuration or a Functions source is
-selected. A release archive includes this layout:
+Functions remain disabled until you select Firebase configuration or a
+Functions source.
+
+A release archive has this layout:
 
 ```text
 firebase-emu[.exe]
@@ -231,37 +267,56 @@ functions-runtime/
   node_modules/        # production adapter dependencies
 ```
 
-The binary resolves the adapter relative to its own executable, so it remains
-portable when the archive is moved. `FIREBASE_FUNCTIONS_ADAPTER` is an explicit
-absolute-path override for custom packaging. Source builds can use
-`FIREBASE_FUNCTIONS_ADAPTER="$PWD/functions-runtime/adapter.cjs"`.
+The binary finds the adapter relative to its executable. You can move the
+extracted archive. Set `FIREBASE_FUNCTIONS_ADAPTER` to an absolute path only
+when you use custom packaging.
 
-Install every Functions application's own locked dependencies, then select a
-matching Node 18, 20, or 22 executable with `FIREBASE_FUNCTIONS_NODE_18`, `_20`,
-or `_22` (or `FIREBASE_FUNCTIONS_NODE`):
+A source build can use this setting:
+
+```sh
+FIREBASE_FUNCTIONS_ADAPTER="$PWD/functions-runtime/adapter.cjs"
+```
+
+Install the locked dependencies for each Functions application. Then select a
+Node 18, 20, or 22 executable. Use `FIREBASE_FUNCTIONS_NODE_18`,
+`FIREBASE_FUNCTIONS_NODE_20`, or `FIREBASE_FUNCTIONS_NODE_22`. You can also
+use `FIREBASE_FUNCTIONS_NODE`.
 
 ```sh
 FIREBASE_FUNCTIONS_NODE_22=/path/to/node \
   firebase-emu --config /path/to/firebase-project --project demo-local
 ```
 
-The Rust process reads `firebase.json`, `.firebaserc`, dotenv files, and legacy
-runtime config; owns public routing and child lifecycle; and starts one private
-Node worker per codebase. HTTP/callable endpoints use
-`http://127.0.0.1:5001/<project>/<region>/<function>`. Supported v1 background
-triggers are Firestore create/update/delete/write, Storage finalize/delete,
-Pub/Sub publish, and schedules. At startup every v1
-`functions.pubsub.topic(...).onPublish(...)` export is registered with a local
-topic and an independent durable subscription before the Functions-ready log is
-printed. Real SDK publishes then flow through that subscription; the handler is
-ACKed only after success and is redelivered after failure. The existing explicit
-HTTP injection route remains available for compatibility and invokes handlers
-directly, so one request cannot enter both paths or double-dispatch. See
-[FUNCTIONS-CONFIG.md](FUNCTIONS-CONFIG.md) and [PUBSUB.md](PUBSUB.md).
+The Rust process reads `firebase.json`, `.firebaserc`, dotenv files, and
+legacy runtime configuration. It owns public routing and child-process
+lifecycle. It starts one private Node worker for each codebase.
+
+HTTP and callable endpoints use this format:
+`http://127.0.0.1:5001/<project>/<region>/<function>`.
+
+FireRust supports these v1 background triggers:
+
+- Firestore create, update, delete, and write
+- Storage finalize and delete
+- Pub/Sub publish
+- schedules
+
+At startup, FireRust registers each v1
+`functions.pubsub.topic(...).onPublish(...)` export. Each export gets a local
+topic and an independent durable subscription. Registration completes before
+the Functions-ready log appears.
+
+SDK publishes flow through the subscription. FireRust acknowledges a handler
+only after it succeeds. It delivers the message again after a failure.
+
+The explicit HTTP injection route remains available for compatibility. It
+calls handlers directly. One request cannot use both routes, so it cannot
+cause two deliveries. Read [FUNCTIONS-CONFIG.md](FUNCTIONS-CONFIG.md) and
+[PUBSUB.md](PUBSUB.md).
 
 ## Deterministic test setup
 
-All Node workspaces have committed lockfiles. Bootstrap a clean checkout with:
+All Node workspaces have committed lockfiles. Prepare a clean checkout:
 
 ```sh
 npm ci --prefix functions-runtime --ignore-scripts
@@ -271,7 +326,7 @@ npm ci --prefix examples/web-app --ignore-scripts
 npx --prefix functions-runtime playwright install chromium
 ```
 
-Run bounded checks with:
+Run the bounded checks:
 
 ```sh
 cargo fmt --all -- --check
@@ -284,93 +339,121 @@ npm test --prefix examples/node-app
 npm test --prefix examples/web-app
 ```
 
-Every pull request is validated when it is opened, updated, reopened, or marked
-ready for review. The `Rust and Functions checks` job checks out the exact PR
-head, cancels superseded runs for the same PR, and has a 30-minute timeout. It
-runs the locked Rust formatting/check/clippy gates and all Rust targets, then
-builds the release binary and exercises real Node/Admin and browser Firebase
-SDK traffic, the relocated full Functions runtime, SQLite WAL process restart
-and crash recovery, browser restart persistence, and durable Functions outbox
-redelivery at the delivery/ack crash boundary. A failure in any suite fails that
-single validation job; emulator logs are printed when the SDK gate fails.
+Pull request validation uses the exact pull request head. It starts when you
+open, update, reopen, or mark a pull request ready for review. It cancels an
+older run for the same pull request. The job has a 30-minute limit.
 
-The separate reusable `Release binaries` workflow retains native build and
-packaged smoke coverage for Linux x64/arm64, macOS x64/arm64, and Windows x64.
-It does not run for pull requests. It runs only when manually dispatched or
-called by the serialized default-branch automatic-release workflow, which
-requests publication only after its required validation job succeeds.
+The `Rust and Functions checks` job runs the locked Rust checks and all Rust
+test targets. It builds the release binary. It also tests these functions:
 
-`PLAYWRIGHT_CHROMIUM_EXECUTABLE` selects an explicit Chromium executable;
-otherwise browser tests use Playwright's managed Chromium. The full Functions
-test relocates the release binary, adapter, dependencies, and fixtures before
-startup so it cannot fall back to the source checkout.
+- real Node Admin SDK traffic
+- real browser Firebase SDK traffic
+- the relocated Functions runtime
+- SQLite WAL restart and crash recovery
+- browser restart persistence
+- durable Functions outbox redelivery at the delivery and acknowledgement
+  crash boundary
 
-The generic SDK matrix is `./scripts/sdk-compat.sh`. Set
-`SDK_COMPAT_INSTALL=1` to install any missing locked dependencies. It supports
-isolated ports through the emulator host/port environment variables. The
-Google-emulator half additionally needs Java and the pinned Firebase CLI in
-`compat/`; the expensive official/browser matrix is also available as a manual
-CI workflow.
+One failed suite fails the validation job. If the SDK gate fails, the job
+prints the emulator logs.
+
+The `Release binaries` workflow builds and tests native packages for Linux
+x64 and arm64, macOS x64 and arm64, and Windows x64. It does not run for pull
+requests. A maintainer can run it manually. The automatic release workflow can
+also call it after the required validation job succeeds.
+
+Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to use a specified Chromium executable.
+If you do not set it, the browser tests use Playwright Chromium. The Functions
+test moves the release binary, adapter, dependencies, and fixtures before
+startup. This test prevents fallback to the source checkout.
+
+Run the generic SDK matrix with `./scripts/sdk-compat.sh`. Set
+`SDK_COMPAT_INSTALL=1` to install missing locked dependencies. Use the
+emulator host and port environment variables to select isolated ports.
+
+The Google-emulator half also requires Java and the pinned Firebase CLI in
+`compat/`. You can run the official and browser matrix with the manual CI
+workflow.
 
 ## Implemented scope
 
-Firestore supports document CRUD, batch reads/writes, scoped reset, nested
-update masks, partial merge, numeric increment, array union, field deletion,
-server timestamps, filters, ordering, limits, offsets, cursors, projections,
-transactions used by the tested SDK, and document/query listeners. Browser
-REST and WebChannel share the gRPC store.
+### Firestore
 
-Auth supports Admin account operations and browser email/password sign-up,
-sign-in, profile operations, token lookup, and refresh. ID sessions expire after
-one hour; refresh sessions expire after 30 days. Expired sessions are pruned
-opportunistically, and deleting a user invalidates all of that user's sessions.
+Firestore supports document create, read, update, and delete. It supports
+batch reads and writes, scoped reset, nested update masks, partial merge,
+numeric increment, array union, field deletion, and server timestamps.
 
-Storage supports Node GCS and browser upload/download/list/delete, CORS,
-CRC32C metadata, and resumable chunks. Abandoned resumable sessions expire
-after one hour and are pruned opportunistically.
+Firestore also supports filters, ordering, limits, offsets, cursors,
+projections, transactions used by the tested SDK, and document and query
+listeners. Browser REST and WebChannel use the same gRPC store.
 
-Pub/Sub supports real `google.pubsub.v1.Publisher` and `Subscriber` gRPC APIs
-for topic/subscription CRUD and listing, publishing, unary Pull, StreamingPull,
-ACK, deadline extension, nack/redelivery, per-subscription fanout, and restart
-recovery. The tested Node clients are `@google-cloud/pubsub` 4.11.0 (the current
-`upload-functions` lock) and 2.19.4 (the current `peakflo-web/functions` lock).
-Set `PUBSUB_EMULATOR_HOST=127.0.0.1:8085`; credentials and production endpoints
-are not used. See [PUBSUB.md](PUBSUB.md) for an SDK example and precise limits.
+### Auth
+
+Auth supports Admin account operations. It supports browser email and password
+sign-up, sign-in, profile operations, token lookup, and refresh.
+
+ID sessions expire after one hour. Refresh sessions expire after 30 days.
+FireRust removes expired sessions during normal work. Deleting a user
+invalidates all sessions for that user.
+
+### Storage
+
+Storage supports Node GCS and browser upload, download, list, and delete. It
+also supports CORS, CRC32C metadata, and resumable chunks.
+
+An abandoned resumable session expires after one hour. FireRust removes
+expired sessions during normal work.
+
+### Pub/Sub
+
+Pub/Sub supports the real `google.pubsub.v1.Publisher` and
+`google.pubsub.v1.Subscriber` gRPC APIs. It supports topic and subscription
+create, read, update, delete, and list operations. It also supports publish,
+unary Pull, StreamingPull, acknowledge, deadline extension, nack and
+redelivery, per-subscription fanout, and restart recovery.
+
+The tested Node clients are `@google-cloud/pubsub` 4.11.0 from the current
+`upload-functions` lock and 2.19.4 from the current
+`peakflo-web/functions` lock.
+
+Set `PUBSUB_EMULATOR_HOST=127.0.0.1:8085`. FireRust does not use credentials
+or production endpoints. Read [PUBSUB.md](PUBSUB.md) for an SDK example and
+the limits.
 
 ## Deliberate limits
 
-This emulator does not implement Security Rules, production transaction
-isolation, composite-index enforcement, aggregation or partition queries, or
-Firestore maximum/minimum/array-remove transforms. Storage does not implement
-resumable retry recovery, IAM, or signed-URL verification. Auth is not a full
-production identity service. Pub/Sub push delivery, IAM, schemas, filters,
-snapshots/seek, dead-letter policies, ordering guarantees, exactly-once delivery,
-and Functions v2/CloudEvent Pub/Sub triggers are not implemented. Unsupported
-Pub/Sub configuration is rejected instead of being accepted and discarded.
-RTDB, Eventarc, task queue, and analytics are not implemented.
+Firestore does not implement Security Rules, production transaction isolation,
+composite-index enforcement, aggregation queries, partition queries, or
+maximum, minimum, and array-remove transforms.
+
+Storage does not implement resumable retry recovery, IAM, or signed-URL
+verification. Auth is not a complete production identity service.
+
+Pub/Sub does not implement push delivery, IAM, schemas, filters, snapshots,
+seek, dead-letter policies, ordering guarantees, exactly-once delivery, or
+Functions v2 and CloudEvent Pub/Sub triggers. FireRust rejects unsupported
+Pub/Sub configuration. It does not silently discard it.
+
+FireRust does not implement RTDB, Eventarc, task queues, or analytics.
 
 The final pre-cleanup validation historically passed 45 Rust tests, a 68-check
-SDK matrix, and two separate real-application compatibility suites (18 checks
-and 11 checks, respectively). Those are historical results, not claims about
-this revision. Current commands and results are recorded in
-[compat-sdk/README.md](compat-sdk/README.md).
+SDK matrix, and two real-application compatibility suites with 18 and 11
+checks. These results do not apply automatically to this revision. Read
+[compat-sdk/README.md](compat-sdk/README.md) for current commands and recorded
+results.
 
-## Recorded resource measurements (historical, v0.1.3)
+## License and product names
 
-In a historical v0.1.3 comparison, idle emulator process-tree RSS was
-**68.1–68.2 MB**, compared with **735.3–781.7 MB** for the official suite
-(about 91% lower). This included the Functions worker and excluded the load
-driver. Rust used SQLite; the official suite used memory storage. These are
-recorded results, not a v0.1.5 speed or memory guarantee. See
-[conditions and limits](docs/BENCHMARKS.md).
+Project code is available under the Apache License 2.0. Reduced Google API
+Protocol Buffer definitions keep the Google copyright and Apache notices.
+Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Licensing and provenance
-
-Project code is offered under Apache License 2.0. Reduced Google API Protocol
-Buffer definitions retain Google copyright and Apache notices; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Firebase and Google product
-names are trademarks of their owners and do not imply endorsement.
+Firebase and Google product names are trademarks of their owners. Their use
+does not show endorsement.
 
 ## Support
 
-[Report a bug](https://github.com/dimavedenyapin/firebase-emu/issues/new/choose) with the version, OS, SDK version, and a small synthetic reproduction. See [release policy](docs/RELEASING.md) and [changelog](CHANGELOG.md).
+[Report a bug](https://github.com/dimavedenyapin/firebase-emu/issues/new/choose).
+Include the version, operating system, SDK version, and a small synthetic
+reproduction. Read the [release policy](docs/RELEASING.md) and
+[changelog](CHANGELOG.md).
