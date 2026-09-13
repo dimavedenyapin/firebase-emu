@@ -1,10 +1,29 @@
 # Firebase emulator in Rust
 
-One loopback-only process serves an embedded emulator UI (4000), Firestore gRPC and browser WebChannel (8080),
-Auth REST (9099), Storage REST (9199), Google Pub/Sub gRPC (8085), and optional
-Firebase Functions (5001). It is intended for local development and tests with
-`demo-` projects, not production traffic. The backwards-compatible default is
-in-memory; `--data-dir` opts into durable local persistence.
+A local Firebase emulator for development and automated tests. One Rust process
+serves Firestore, Auth, Storage, Pub/Sub, and a browser console. An optional Node
+worker runs Firebase Functions. Local data can remain in memory or persist in SQLite.
+
+**Public beta.** This independent project is not affiliated with Google. Security
+Rules and production transaction isolation are not implemented. Use synthetic data
+and `demo-` projects. Passing a test here does not prove production compatibility.
+
+[Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md) ·
+[Troubleshooting](docs/TROUBLESHOOTING.md) · [Contributing](CONTRIBUTING.md) ·
+[Security](SECURITY.md) · [Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
+
+## Quickstart (v0.1.4)
+
+Run the published v0.1.4 binary with Node 22. No Rust install is needed:
+
+```sh
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
+```
+
+Open the resolved loopback URL printed at startup. Use a `demo-` project and
+synthetic data only. See [Compatibility](docs/COMPATIBILITY.md) for the beta
+scope and [Benchmarks](docs/BENCHMARKS.md) for recorded resource measurements.
+The benchmark figures are historical v0.1.3 results, not v0.1.4 guarantees.
 
 ## Install and run
 
@@ -17,41 +36,13 @@ Release archives are built and smoke-tested natively for:
 - Windows Server 2022 x64 (`x86_64-pc-windows-msvc`)
 
 Those are tested baselines, not claims of compatibility with older operating
-system or libc versions.
+system or libc versions. The supported runnable path uses Node 22, as shown in
+[Quickstart](#quickstart-v014).
 
-Merging to `main` (or otherwise pushing a reviewed commit to `main`) starts an
-automatic release. The workflow records one synchronized source version, runs
-the required Rust/Node CI gates, builds and smoke-tests all five native targets,
-verifies the complete bundle, and only then publishes a normal, non-draft
-GitHub Release. No manually created tag or follow-up release PR is needed.
-
-The first merge publishes the current `0.1.0` version if `v0.1.0` is unused.
-After that, an unchanged or stale source version is advanced from the latest
-stable release by one patch (for example, `0.1.0` to `0.1.1`). To intentionally
-release a minor or major version, update all six version-bearing manifests in
-the same feature PR to a stable version greater than every existing release:
-`Cargo.toml`, the `firebase-emu` entry in `Cargo.lock`, the root `package.json`
-and root package in `package-lock.json`, plus the equivalent two files under
-`functions-runtime/`. Such a forward source version is honored; a version not
-greater than the latest release is overridden by the automatic patch policy.
-
-The automatic patch is a normal fast-forward `github-actions[bot]` commit on
-`main`, never a force push. It carries a source-commit marker so retries reuse
-the same version commit. Default-branch release runs are serialized, stale
-runs refuse to overwrite newer work, existing tags must already point to the
-exact built commit, and an existing published release must have byte-identical
-assets. GitHub's built-in `GITHUB_TOKEN` performs the commit, tag, and release;
-the build and publication remain in one workflow graph because a tag pushed by
-that token does not start another workflow. Repositories that later protect
-`main` must explicitly permit this ordinary version commit or choose a policy
-that accepts it; the workflow does not bypass branch protection or require a
-hidden PAT.
-
-Once `v0.1.0` is published, Node 18+ users can run its verified prebuilt asset
-without installing Rust:
+Use Node 22 to run the published binary without installing Rust:
 
 ```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.0 --no-functions
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
 ```
 
 The launcher downloads the matching public GitHub Release archive, verifies it
@@ -88,6 +79,8 @@ conventions:
 
 ## Emulator UI
 
+Use the resolved URL printed at startup when you select `--ui-port 0`.
+
 Open `http://127.0.0.1:4000` after startup. The UI is embedded in the executable,
 uses only the loopback services in the same process, and never discovers cloud
 credentials or production endpoints. The project selector controls all three
@@ -114,8 +107,7 @@ preserves Firestore types that plain JSON cannot represent safely.
 operation is atomic, preserves Firestore field types, and always uses a
 must-not-exist precondition, so it cannot overwrite an existing destination.
 Subcollections are excluded by default and can only be included with the
-separate checkbox. Object creation from an external source is intentionally not
-implemented until its source and format are specified.
+separate checkbox. Import from an external object source is outside the beta scope.
 
 ## Durable local data
 
@@ -127,9 +119,7 @@ firebase-emu --data-dir "./.firebase-emu-data" --no-functions
 firebase-emu --data-dir "./local data/firebase" --no-functions
 ```
 
-These options are newer than `v0.1.0`; use a binary built from this branch until
-the next release is published. After that release, the GitHub `npx` launcher
-for that tag accepts the same arguments.
+Persistence is available in v0.1.4. The GitHub launcher accepts these arguments.
 
 `--data-dir` and `--in-memory` conflict and are rejected. Relative data paths
 resolve from the process working directory, independently of `--config`; the
@@ -328,9 +318,23 @@ and 11 checks, respectively). Those are historical results, not claims about
 this revision. Current commands and results are recorded in
 [compat-sdk/README.md](compat-sdk/README.md).
 
+## Recorded resource measurements (historical, v0.1.3)
+
+In a historical v0.1.3 comparison, idle emulator process-tree RSS was
+**68.1–68.2 MB**, compared with **735.3–781.7 MB** for the official suite
+(about 91% lower). This included the Functions worker and excluded the load
+driver. Rust used SQLite; the official suite used memory storage. These are
+recorded results, not a v0.1.4 speed or memory guarantee. Startup is not a
+headline claim: its readiness evidence is unclear. See
+[conditions and limits](docs/BENCHMARKS.md).
+
 ## Licensing and provenance
 
 Project code is offered under Apache License 2.0. Reduced Google API Protocol
 Buffer definitions retain Google copyright and Apache notices; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Firebase and Google product
 names are trademarks of their owners and do not imply endorsement.
+
+## Support
+
+[Report a bug](https://github.com/dimavedenyapin/firebase-emu/issues/new/choose) with the version, OS, SDK version, and a small synthetic reproduction. See [release policy](docs/RELEASING.md) and [changelog](CHANGELOG.md).
