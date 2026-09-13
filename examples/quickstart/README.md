@@ -9,7 +9,7 @@ and the emulator binary.
    example:
 
    ```sh
-   npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
+   npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
    ```
 
 2. From the repository root, run the seed script:

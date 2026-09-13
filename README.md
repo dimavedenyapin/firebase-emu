@@ -13,18 +13,18 @@ and `demo-` projects. Passing a test here does not prove production compatibilit
 [Troubleshooting](docs/TROUBLESHOOTING.md) · [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md) · [Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
 
-## Quickstart (v0.1.4)
+## Quickstart (v0.1.5)
 
-Run the published v0.1.4 binary with Node 22. No Rust install is needed:
+After v0.1.5 is published, run its binary with Node 22. No Rust install is needed:
 
 ```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
 ```
 
 Open the resolved loopback URL printed at startup. Use a `demo-` project and
 synthetic data only. See [Compatibility](docs/COMPATIBILITY.md) for the beta
 scope and [Benchmarks](docs/BENCHMARKS.md) for recorded resource measurements.
-The benchmark figures are historical v0.1.3 results, not v0.1.4 guarantees.
+The benchmark figures are historical v0.1.3 results, not v0.1.5 guarantees.
 Then run the [minimal synthetic-data example](examples/quickstart/README.md).
 
 ## Install and run
@@ -39,12 +39,12 @@ Release archives are built and smoke-tested natively for:
 
 Those are tested baselines, not claims of compatibility with older operating
 system or libc versions. The supported runnable path uses Node 22, as shown in
-[Quickstart](#quickstart-v014).
+[Quickstart](#quickstart-v015).
 
 Use Node 22 to run the published binary without installing Rust:
 
 ```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
 ```
 
 The launcher downloads the matching public GitHub Release archive, verifies it
@@ -125,7 +125,7 @@ firebase-emu --data-dir "./.firebase-emu-data" --no-functions
 firebase-emu --data-dir "./local data/firebase" --no-functions
 ```
 
-Persistence is available in v0.1.4. The GitHub launcher accepts these arguments.
+Persistence is available in v0.1.5. The GitHub launcher accepts these arguments.
 
 `--data-dir` and `--in-memory` conflict and are rejected. Relative data paths
 resolve from the process working directory, independently of `--config`; the
@@ -330,7 +330,7 @@ In a historical v0.1.3 comparison, idle emulator process-tree RSS was
 **68.1–68.2 MB**, compared with **735.3–781.7 MB** for the official suite
 (about 91% lower). This included the Functions worker and excluded the load
 driver. Rust used SQLite; the official suite used memory storage. These are
-recorded results, not a v0.1.4 speed or memory guarantee. See
+recorded results, not a v0.1.5 speed or memory guarantee. See
 [conditions and limits](docs/BENCHMARKS.md).
 
 ## Licensing and provenance

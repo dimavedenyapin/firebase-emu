@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 — pending publication
 
 - Prepare public beta documentation, historical benchmark disclosure and support files.
 - Add security and release acceptance controls. See the launch report for validation.

@@ -15,7 +15,7 @@ AUTH_PORT = 9099
 FIRESTORE_PORT = 8080
 
 START_COMMAND = (
-    f"npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 "
+    f"npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 "
     f"--project {PROJECT} --ui-port 0 --no-functions"
 )
 

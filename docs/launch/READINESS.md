@@ -8,7 +8,8 @@ public-beta review branch. The announcement files are drafts. Do not post them.
 ## Review scope
 
 The review branch starts at `0a3e40f`, the source commit for published
-`v0.1.4`. It integrates these reviewed worker commits:
+`v0.1.4`. It selects v0.1.5 for the patched release and integrates these
+reviewed worker commits:
 
 - Documentation: `7deff787c238ea7559edd893d7cdd9f2ae7d80bd`
 - Security: `979e687f1b521c636e224f3f9c136f9239c2b68d`
@@ -90,9 +91,9 @@ version-commit bot from supplying its own required approval.
 
 1. Review and approve the public-beta preparation pull request.
 2. Merge it only after the required exact-head check passes.
-3. Review and merge the generated version pull request for the selected patched
-   release. The expected automatic patch is v0.1.5 unless a higher version is
-   selected in the review pull request.
+3. Confirm that the reviewed version files select v0.1.5. This avoids a second
+   version pull request for this release. Do not select a different tag after
+   approval.
 4. Confirm that automatic release CI, five native builds, package smoke tests,
    checksums, attestations, and publication all pass for that release.
 5. Run published five-platform acceptance for that new tag.

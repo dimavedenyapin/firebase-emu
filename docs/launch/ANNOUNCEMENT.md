@@ -1,9 +1,10 @@
 # Public beta announcement — DRAFT
 
 Do not post this text. It is a draft. It waits for final launch
-checks and the selected release. The current published release is
-v0.1.4. It does not contain the new security patches from the launch
-branch. Do not present unmerged fixes as part of v0.1.4.
+checks and the selected release. The selected patched release is
+v0.1.5. It is not published yet. The current published release is
+v0.1.4, and it does not contain the new security patches. Do not
+present unmerged fixes as part of v0.1.4.
 
 ## Announcement draft
 
@@ -21,7 +22,7 @@ API. It does not promise production parity.
 To try it, use Node 22 and run:
 
 ```sh
-npx --yes github:dimavedenyapin/firebase-emu#v0.1.4 --project demo-local --ui-port 0 --no-functions
+npx --yes github:dimavedenyapin/firebase-emu#v0.1.5 --project demo-local --ui-port 0 --no-functions
 ```
 
 Open the console URL that startup prints. To keep data between runs,
@@ -65,6 +66,6 @@ https://github.com/dimavedenyapin/firebase-emu
 
 ## Before publication
 
-Confirm the final release tag and acceptance results in the launch
-report. If a new release includes the security fixes, update the npx
-command. Keep this file marked as draft until release selection.
+Confirm that v0.1.5 is published and that its acceptance results pass.
+Keep this file marked as draft until that check and the final editorial
+review are complete.
