@@ -67,8 +67,10 @@ The ruleset blocks force-push and deletion. It also requires:
 The automatic workflow writes only its unprotected `automation/release-*`
 branch. It cannot write directly to `main`. This makes the controls compatible
 with the release flow on a personal-account repository. The repository permits
-GitHub Actions to create pull requests, but the workflow has no step or
-permission that approves or merges them.
+GitHub Actions to create or approve pull requests. This combined GitHub setting
+is necessary for pull request creation. The workflow does not submit a review
+or merge. The last-push rule also prevents the bot that pushed the version
+commit from supplying its required approval.
 
 ## Launch checks
 

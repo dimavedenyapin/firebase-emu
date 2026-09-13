@@ -82,8 +82,9 @@ approval after the last push, resolved review threads, a current branch, and
 the GitHub Actions `Rust and Functions checks` result. It will continue to block
 force-push and deletion. It has no bypass actor. The repository keeps default
 workflow permissions read-only and permits GitHub Actions to create pull
-requests. The release workflow has only its explicit job permissions and has no
-approval or merge step.
+requests or approve them. This is one combined GitHub setting. The release
+workflow does not submit a review or merge, and the last-push rule prevents the
+version-commit bot from supplying its own required approval.
 
 ## Remaining launch actions
 
