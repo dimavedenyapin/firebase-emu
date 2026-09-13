@@ -1,4 +1,4 @@
-# Pub/Sub emulator
+# FireRust Pub/Sub emulator
 
 The binary exposes the real `google.pubsub.v1.Publisher` and
 `google.pubsub.v1.Subscriber` gRPC services on `127.0.0.1:8085` by default. It

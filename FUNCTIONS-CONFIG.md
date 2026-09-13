@@ -1,6 +1,6 @@
-# Local Functions configuration
+# FireRust local Functions configuration
 
-`src/functions_config.rs` discovers Firebase Functions configuration without
+FireRust uses `src/functions_config.rs` to discover Firebase Functions configuration without
 calling Firebase, Google Cloud, metadata services, or secret managers. The
 runtime must pass its parsed command-line overrides and an environment snapshot
 to `functions_config::load`.

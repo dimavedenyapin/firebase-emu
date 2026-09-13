@@ -1,8 +1,8 @@
-# Minimal local example
+# Minimal FireRust local example
 
 This example needs no Firebase SDK. It needs no Node project. It needs no cloud
 credential. It needs no private Peakflo application. It needs only Python 3
-and the emulator binary.
+and the FireRust emulator binary. The compatible executable name is `firebase-emu`.
 
 1. Start the emulator on its default ports with an empty `demo-local` project.
    Use the [main README install command](../../README.md#install-and-run). For

@@ -1,4 +1,4 @@
-# SDK compatibility matrix
+# FireRust SDK compatibility matrix
 
 The current public matrix contains 68 required assertions: 60 emulator I/O
 capabilities (17 Node and 13 browser checks against both targets) plus eight

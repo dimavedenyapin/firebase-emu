@@ -1,4 +1,4 @@
-# Storage integration notes
+# FireRust Storage integration notes
 
 The Storage router uses axum 0.8, tower-http CORS, and the shared loopback HTTP listener. It supports GCS JSON routes, Firebase `/v0` routes, and local signed-URL-style requests.
 
