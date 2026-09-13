@@ -24,15 +24,32 @@ TARGETS = {
     "x86_64-pc-windows-msvc",
 }
 CHECKSUM_RE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.+-]+)")
+MAX_ARCHIVE_DOWNLOAD_BYTES = 600 * 1024 * 1024
+MAX_MANIFEST_DOWNLOAD_BYTES = 2 * 1024 * 1024
 
 
-def download(url: str, destination: Path) -> None:
+def download(url: str, destination: Path, maximum_bytes: int) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": "firebase-emu-release-acceptance"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
         if response.status != 200:
             raise RuntimeError(f"download returned HTTP {response.status}: {url}")
+        content_length = response.headers.get("content-length")
+        if content_length is not None and int(content_length) > maximum_bytes:
+            raise RuntimeError(f"download exceeds size limit: {url}")
+        received = 0
         while chunk := response.read(1024 * 1024):
+            received += len(chunk)
+            if received > maximum_bytes:
+                raise RuntimeError(f"download exceeds size limit: {url}")
             output.write(chunk)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def read_checksums(path: Path) -> dict[str, str]:
@@ -69,12 +86,12 @@ def main() -> None:
         temp = Path(temporary)
         archive = temp / archive_name
         manifest = temp / manifest_name
-        download(f"{base_url}/{archive_name}", archive)
-        download(f"{base_url}/{manifest_name}", manifest)
+        download(f"{base_url}/{archive_name}", archive, MAX_ARCHIVE_DOWNLOAD_BYTES)
+        download(f"{base_url}/{manifest_name}", manifest, MAX_MANIFEST_DOWNLOAD_BYTES)
 
         entries = read_checksums(manifest)
         expected = entries.get(archive_name)
-        actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+        actual = sha256_file(archive)
         if expected is None:
             raise RuntimeError(f"checksum manifest does not list {archive_name}")
         if not hmac.compare_digest(expected, actual):

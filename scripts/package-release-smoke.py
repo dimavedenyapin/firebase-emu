@@ -139,7 +139,7 @@ def stop(process: ManagedProcess) -> None:
 
 
 def safe_member_name(name: str) -> PurePosixPath:
-    if not name or "\\" in name:
+    if not name or "\\" in name or ":" in name:
         raise RuntimeError(f"unsafe archive member name: {name!r}")
     path = PurePosixPath(name)
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
