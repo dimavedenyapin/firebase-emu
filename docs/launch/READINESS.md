@@ -37,8 +37,30 @@ screenshots.
 
 ## Evidence for the review branch
 
-Exact-head source CI, native package checks, browser checks, and the final head
-will be recorded here after the review branch is pushed.
+The review pull request is:
+https://github.com/dimavedenyapin/firebase-emu/pull/10
+
+The pull request checks page records exact-head source CI and published v0.1.4
+acceptance for the final review head:
+https://github.com/dimavedenyapin/firebase-emu/pull/10/checks
+
+A manual `Release binaries` run builds and smoke-tests the five native targets
+from the review branch. Its publish job must remain skipped. The pull request
+and the task report record the final run URL.
+
+Local integration checks passed 87/87 Rust tests and a locked release build.
+A real browser on nondefault loopback ports passed Auth, Firestore, and the real
+empty Pub/Sub state. A Firestore integer edit and document clone remained after
+a process restart. The clone no-overwrite check returned the expected HTTP 409.
+Stored script markup in a field name and value did not execute. The normal UI
+path had zero browser errors and warnings; the deliberate duplicate-clone check
+added only the expected failed-resource entry for HTTP 409.
+
+Exact same-origin UI requests passed on IPv4 and IPv6. A different loopback
+Origin and an external Host both returned HTTP 403. Accepted and rejected UI
+responses included CSP, `nosniff`, and `no-store` headers. The old screenshots
+still match the material UI behavior, so they were not replaced. Their old-base
+provenance remains explicit.
 
 The security worker recorded 87 passing Rust tests, Node SDK 19/19, browser SDK
 15/15, Functions adapter 10/10, full Functions 1/1, production Functions npm
@@ -55,10 +77,13 @@ must approve the exact version commit after `Rust and Functions checks` passes.
 After merge, the workflow runs exact-head CI again before it can build, attest,
 tag, or publish.
 
-The `main-beta-hardening-core` ruleset will require the pull request, one
+The active `main-beta-hardening-core` ruleset requires the pull request, one
 approval after the last push, resolved review threads, a current branch, and
 the GitHub Actions `Rust and Functions checks` result. It will continue to block
-force-push and deletion. It has no bypass actor.
+force-push and deletion. It has no bypass actor. The repository keeps default
+workflow permissions read-only and permits GitHub Actions to create pull
+requests. The release workflow has only its explicit job permissions and has no
+approval or merge step.
 
 ## Remaining launch actions
 
