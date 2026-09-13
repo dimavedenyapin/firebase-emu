@@ -15,8 +15,9 @@ use crate::{
     },
 };
 use axum::{
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{Query, Request as AxumRequest, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -65,6 +66,44 @@ pub(crate) fn router(state: UiState) -> Router {
         .route("/api/firestore/clone", post(clone_document))
         .route("/api/pubsub", get(pubsub_resources))
         .with_state(state)
+        .layer(middleware::from_fn(console_boundary))
+}
+
+// Reject DNS rebinding hosts and cross-origin browser access to console data.
+// The SDK listeners have separate CORS requirements; this applies only to the UI.
+async fn console_boundary(request: AxumRequest, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if !crate::http_security::has_loopback_authority(request.headers(), request.uri()) {
+        return secure_console_response(api_error(
+            StatusCode::FORBIDDEN,
+            "console requires a loopback Host",
+        ));
+    }
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let expected = format!("http://{}", host.unwrap_or_default());
+        if origin.to_str().ok() != Some(expected.as_str()) {
+            return secure_console_response(api_error(
+                StatusCode::FORBIDDEN,
+                "console requires the same origin",
+            ));
+        }
+    }
+    secure_console_response(next.run(request).await)
+}
+
+fn secure_console_response(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn index() -> Html<&'static str> {
@@ -439,7 +478,13 @@ mod tests {
         let app = router(state());
         let response = app
             .clone()
-            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .header("host", "127.0.0.1:4000")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -451,10 +496,58 @@ mod tests {
         ] {
             let response = app
                 .clone()
-                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .oneshot(
+                    HttpRequest::builder()
+                        .header("host", "127.0.0.1:4000")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn console_rejects_rebinding_and_cross_origin_reads() {
+        for (host, origin, expected) in [
+            ("", None, StatusCode::FORBIDDEN),
+            ("attacker.example:4000", None, StatusCode::FORBIDDEN),
+            (
+                "127.0.0.1:4000",
+                Some("https://attacker.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            ("127.0.0.1:4000", Some("null"), StatusCode::FORBIDDEN),
+            (
+                "127.0.0.1:4000",
+                Some("http://127.0.0.1:4000"),
+                StatusCode::OK,
+            ),
+            ("[::1]:43117", Some("http://[::1]:43117"), StatusCode::OK),
+            ("LOCALHOST:4000", None, StatusCode::OK),
+        ] {
+            let mut request = HttpRequest::builder().uri("/api/config");
+            if !host.is_empty() {
+                request = request.header("host", host);
+            }
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = router(state())
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+            assert!(response
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY));
         }
     }
 
@@ -482,6 +575,7 @@ mod tests {
     async fn request_json(app: Router, method: &str, uri: &str, body: Value) -> Response {
         app.oneshot(
             HttpRequest::builder()
+                .header("host", "127.0.0.1:4000")
                 .method(method)
                 .uri(uri)
                 .header("content-type", "application/json")
@@ -639,6 +733,7 @@ mod tests {
         let response = router(state)
             .oneshot(
                 HttpRequest::builder()
+                    .header("host", "127.0.0.1:4000")
                     .uri("/api/pubsub?project=demo-ui")
                     .body(Body::empty())
                     .unwrap(),
@@ -660,6 +755,7 @@ mod tests {
         let response = router(state())
             .oneshot(
                 HttpRequest::builder()
+                    .header("host", "127.0.0.1:4000")
                     .uri("/api/auth/users?project=demo-ui")
                     .body(Body::empty())
                     .unwrap(),

@@ -1446,7 +1446,13 @@ pub(crate) async fn serve(
     };
     runtime.trigger_subscriptions = trigger_subscriptions;
     let queue = tokio::spawn(run_queue(runtime.clone(), rx));
-    let router = control_router().fallback(proxy).with_state(runtime);
+    let router =
+        control_router()
+            .fallback(proxy)
+            .with_state(runtime)
+            .layer(axum::middleware::from_fn(
+                crate::http_security::require_loopback_request,
+            ));
     eprintln!("Functions emulator ready on {}", config.addresses.functions);
     let result = tokio::select! {
         result=axum::serve(listener,router)=>result.map_err(|e| -> BoxError{e.into()}),
