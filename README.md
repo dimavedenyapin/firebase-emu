@@ -88,7 +88,11 @@ uses only the loopback services in the same process, and never discovers cloud
 credentials or production endpoints. The project selector controls all three
 views; Firestore also supports named databases.
 
+![Auth console with a synthetic local user](docs/images/console-auth.png)
+
 ![Firestore console with synthetic typed fields](docs/images/console-firestore.png)
+
+![Pub/Sub console with a separate synthetic topic](docs/images/console-pubsub.png)
 
 The screenshots use synthetic local data. They came from a local build of
 `v0.1.4`, before the public-beta security changes. The Pub/Sub image uses a
