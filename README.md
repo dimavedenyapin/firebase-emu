@@ -9,6 +9,7 @@ Rules and production transaction isolation are not implemented. Use synthetic da
 and `demo-` projects. Passing a test here does not prove production compatibility.
 
 [Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md) ·
+[Minimal example](examples/quickstart/README.md) ·
 [Troubleshooting](docs/TROUBLESHOOTING.md) · [Contributing](CONTRIBUTING.md) ·
 [Security](SECURITY.md) · [Releases](https://github.com/dimavedenyapin/firebase-emu/releases)
 
@@ -24,6 +25,7 @@ Open the resolved loopback URL printed at startup. Use a `demo-` project and
 synthetic data only. See [Compatibility](docs/COMPATIBILITY.md) for the beta
 scope and [Benchmarks](docs/BENCHMARKS.md) for recorded resource measurements.
 The benchmark figures are historical v0.1.3 results, not v0.1.4 guarantees.
+Then run the [minimal synthetic-data example](examples/quickstart/README.md).
 
 ## Install and run
 
@@ -85,6 +87,10 @@ Open `http://127.0.0.1:4000` after startup. The UI is embedded in the executable
 uses only the loopback services in the same process, and never discovers cloud
 credentials or production endpoints. The project selector controls all three
 views; Firestore also supports named databases.
+
+![Firestore console with synthetic typed fields](docs/images/console-firestore.png)
+
+See the [Auth, Firestore, and Pub/Sub screenshot notes](docs/images/README.md).
 
 - Auth lists users and shows the complete local user record and parsed custom
   claims.
@@ -324,8 +330,7 @@ In a historical v0.1.3 comparison, idle emulator process-tree RSS was
 **68.1–68.2 MB**, compared with **735.3–781.7 MB** for the official suite
 (about 91% lower). This included the Functions worker and excluded the load
 driver. Rust used SQLite; the official suite used memory storage. These are
-recorded results, not a v0.1.4 speed or memory guarantee. Startup is not a
-headline claim: its readiness evidence is unclear. See
+recorded results, not a v0.1.4 speed or memory guarantee. See
 [conditions and limits](docs/BENCHMARKS.md).
 
 ## Licensing and provenance

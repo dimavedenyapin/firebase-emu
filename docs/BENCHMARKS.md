@@ -7,14 +7,10 @@ They measure v0.1.3, not the current launch branch. Decimal MB = 1,000,000 bytes
 | --- | ---: | ---: |
 | Idle RSS, range across runs | 68.1–68.2 MB | 735.3–781.7 MB |
 | Peak RSS under load, range across runs | 110.2–110.6 MB | 2,345.6–2,435.9 MB |
-| Recorded startup range | 0.01–0.42 s | approximately 16 s |
 
 The recorded idle reduction is about 91%. The official peak includes a transient
 Node process spike in each repetition. It is not a measure of steady Java heap use.
 Do not present the peak difference as a general memory or throughput guarantee.
-Startup is not a headline claim. One official repetition records a negative
-startup value (-43.78 s), so the startup metric is not reliable. Do not use it
-to compare implementations.
 
 ## Conditions
 

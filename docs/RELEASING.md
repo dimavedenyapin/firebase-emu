@@ -1,17 +1,27 @@
 # Release process
 
-A push to `main` starts an automatic release.
+A push to `main` starts the automatic release workflow.
 
-Steps in the automatic release:
-1. The workflow picks the correct version number.
-2. The workflow commits the version files. The commit author is `github-actions[bot]`.
-3. The workflow pushes the version commit to `main`. This push is always a fast-forward push. The workflow does not force-push.
-4. The workflow runs the required Rust and Node CI checks on the exact version commit.
-5. If the checks pass, the workflow builds and smoke-tests five native targets.
-6. The workflow verifies the complete release bundle.
-7. The workflow creates the tag and the GitHub Release.
+If the source files already contain the next version, the workflow continues on
+that exact commit. This applies to an intentional minor or major version change
+that was reviewed in the feature pull request. It also applies after a generated
+version pull request is merged.
 
-You do not need to create a tag by hand. You do not need to open a separate release pull request.
+If an automatic patch change is necessary, the workflow does not push it to
+`main`. It creates an `automation/release-*` branch and opens a version pull
+request. It then dispatches `Rust and Functions checks` for the exact version
+commit. A maintainer must review and merge this pull request. The merge starts
+the automatic release workflow again.
+
+The release run completes these steps:
+
+1. It confirms that the version files do not need another change.
+2. It runs the required Rust and Node CI checks on the exact release commit.
+3. If the checks pass, it builds and smoke-tests five native targets.
+4. It verifies the complete release bundle and creates build attestations.
+5. It creates the tag and the GitHub Release.
+
+Do not create or move a tag by hand.
 
 ## Version numbers
 
@@ -29,9 +39,13 @@ To release a minor or major version, change all six version files in the same fe
 
 The workflow uses this higher version. If the version is not higher than the latest release, the workflow ignores it and uses the automatic patch number instead.
 
-## Safety rules for the automatic version commit
+## Safety rules for the automatic version pull request
 
-- The version commit carries a `Firebase-Emu-Release-Source` trailer. Retries reuse the same commit.
+- The version commit carries a `Firebase-Emu-Release-Source` trailer. Retries
+  reuse the same branch and commit.
+- The workflow cannot merge or approve its version pull request.
+- The version pull request must pass `Rust and Functions checks` and receive an
+  approval from a person other than the last pusher.
 - Release runs on `main` run one at a time (serialized). A stale run cannot overwrite newer work.
 - An existing tag must already point at the exact release commit.
 - An existing published release must have byte-identical assets.
@@ -40,27 +54,21 @@ The workflow uses this higher version. If the version is not higher than the lat
 
 ## Branch protection on `main`
 
-As of this hardening pass, `main` has one active repository ruleset: `main-beta-hardening-core`. This ruleset blocks two actions for every actor, with no exceptions:
-- Force-push to `main`.
-- Deletion of `main`.
+`main` uses the `main-beta-hardening-core` ruleset. It has no bypass actor.
+The ruleset blocks force-push and deletion. It also requires:
 
-The automatic release commit is a normal fast-forward push. This ruleset does not block it.
+- a pull request;
+- one approving review;
+- approval after the most recent push;
+- all review threads to be resolved;
+- the `Rust and Functions checks` GitHub Actions check;
+- the branch to be current before merge.
 
-This ruleset does **not** require a pull request before a push to `main`. This ruleset does **not** require a passing CI check before a push to `main`. Here is why.
-
-GitHub lets a GitHub App bypass ruleset rules only when the repository belongs to an organization. This repository belongs to a personal account, not an organization. A request to add the `github-actions` App (App ID `15368`) as a bypass actor on this repository fails with this exact error:
-
-```
-Actor GitHub Actions integration must be part of the ruleset source or owner organization
-```
-
-Without that bypass, a "require pull request" rule or a "require status checks" rule would also block the automatic version commit. That commit pushes straight to `main` before its own CI run starts, so it can never carry a passing check at push time.
-
-Do not add a "require pull request before merging" rule or a "require status checks to pass" rule for `main` until one of these is true:
-1. The repository moves to a GitHub organization. Then add the `github-actions` App as a bypass actor, with bypass mode "always", scoped only to those two rules.
-2. The automatic release commit changes so it goes through a pull request with auto-merge, instead of a direct push.
-
-Until then, the required CI check (`Rust and Functions checks`, from `ci.yml`) stays informational on a direct push to `main`. It stays a real, enforced gate for the automatic release itself: the `quality` job in `automatic-release.yml` must pass before the `release` job runs and publishes anything.
+The automatic workflow writes only its unprotected `automation/release-*`
+branch. It cannot write directly to `main`. This makes the controls compatible
+with the release flow on a personal-account repository. The repository permits
+GitHub Actions to create pull requests, but the workflow has no step or
+permission that approves or merges them.
 
 ## Launch checks
 

@@ -38,9 +38,9 @@ Total time is about 120 seconds.
 16. Use Copy object on the document.
 17. Explain that explicit type wrappers preserve Firestore values.
 18. Open the Pub/Sub view.
-19. If the fixture provides a demo topic, show the topic and its
-    subscription.
-20. Explain that inspection does not consume messages.
+19. Show the empty-topic state. The quickstart seed does not create a topic.
+20. Explain that inspection does not consume messages. The Pub/Sub screenshot
+    uses a separate synthetic topic setup and is not quickstart seed evidence.
 
 ## 1:20–1:45 — Restart
 
