@@ -90,7 +90,9 @@ views; Firestore also supports named databases.
 
 ![Firestore console with synthetic typed fields](docs/images/console-firestore.png)
 
-See the [Auth, Firestore, and Pub/Sub screenshot notes](docs/images/README.md).
+The screenshots use synthetic local data. They came from a local build of
+`v0.1.4`, before the public-beta security changes. The Pub/Sub image uses a
+separate synthetic topic setup; the quickstart seed does not create a topic.
 
 - Auth lists users and shows the complete local user record and parsed custom
   claims.

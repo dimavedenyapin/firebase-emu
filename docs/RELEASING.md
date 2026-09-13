@@ -10,8 +10,8 @@ version pull request is merged.
 If an automatic patch change is necessary, the workflow does not push it to
 `main`. It creates an `automation/release-*` branch and opens a version pull
 request. It then dispatches `Rust and Functions checks` for the exact version
-commit. A maintainer must review and merge this pull request. The merge starts
-the automatic release workflow again.
+commit. The maintainer must inspect and merge this pull request. The merge
+starts the automatic release workflow again.
 
 The release run completes these steps:
 
@@ -44,8 +44,9 @@ The workflow uses this higher version. If the version is not higher than the lat
 - The version commit carries a `Firebase-Emu-Release-Source` trailer. Retries
   reuse the same branch and commit.
 - The workflow cannot merge or approve its version pull request.
-- The version pull request must pass `Rust and Functions checks` and receive an
-  approval from a person other than the last pusher.
+- The version pull request must pass `Rust and Functions checks`. The sole
+  maintainer can merge it after inspection when all review threads are
+  resolved.
 - Release runs on `main` run one at a time (serialized). A stale run cannot overwrite newer work.
 - An existing tag must already point at the exact release commit.
 - An existing published release must have byte-identical assets.
@@ -58,19 +59,21 @@ The workflow uses this higher version. If the version is not higher than the lat
 The ruleset blocks force-push and deletion. It also requires:
 
 - a pull request;
-- one approving review;
-- approval after the most recent push;
 - all review threads to be resolved;
 - the `Rust and Functions checks` GitHub Actions check;
 - the branch to be current before merge.
+
+The repository has one maintainer. The ruleset does not require an approving
+review, approval after the latest push, or extra approval for unattributed
+changes. The sole maintainer can merge their own pull request after the check
+passes and all review threads are resolved.
 
 The automatic workflow writes only its unprotected `automation/release-*`
 branch. It cannot write directly to `main`. This makes the controls compatible
 with the release flow on a personal-account repository. The repository permits
 GitHub Actions to create or approve pull requests. This combined GitHub setting
 is necessary for pull request creation. The workflow does not submit a review
-or merge. The last-push rule also prevents the bot that pushed the version
-commit from supplying its required approval.
+or merge.
 
 ## Launch checks
 
