@@ -5,6 +5,29 @@ calling Firebase, Google Cloud, metadata services, or secret managers. The
 runtime must pass its parsed command-line overrides and an environment snapshot
 to `functions_config::load`.
 
+## Packaged adapter
+
+A release archive has this layout:
+
+```text
+firebase-emu[.exe]
+functions-runtime/
+  adapter.cjs
+  package.json
+  package-lock.json
+  node_modules/        # production adapter dependencies
+```
+
+The binary finds the adapter relative to its executable. You can move the
+extracted archive. Set `FIREBASE_FUNCTIONS_ADAPTER` to an absolute path only
+when you use custom packaging.
+
+A source build can use this setting:
+
+```sh
+FIREBASE_FUNCTIONS_ADAPTER="$PWD/functions-runtime/adapter.cjs"
+```
+
 Precedence is command-line override, environment, local project files, then
 defaults. Supported environment controls are:
 
