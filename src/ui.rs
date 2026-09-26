@@ -64,6 +64,7 @@ pub(crate) fn router(state: UiState) -> Router {
         .route("/api/auth/users", get(auth_users))
         .route("/api/firestore/documents", get(firestore_documents))
         .route("/api/firestore/field", post(update_field))
+        .route("/api/firestore/field-mutation", post(mutate_field))
         .route("/api/firestore/clone", post(clone_document))
         .route("/api/pubsub", get(pubsub_resources))
         .with_state(state)
@@ -232,6 +233,216 @@ struct UpdateFieldRequest {
 
 fn quoted_field_path(field_name: &str) -> String {
     format!("`{}`", field_name.replace('\\', "\\\\").replace('`', "\\`"))
+}
+
+fn validate_typed_value(value: &Value, depth: usize) -> Result<(), &'static str> {
+    if depth > 20 {
+        return Err("nested value is too deep");
+    }
+    let object = value
+        .as_object()
+        .ok_or("value needs one Firestore type wrapper")?;
+    if object.len() != 1 {
+        return Err("value needs exactly one Firestore type wrapper");
+    }
+    let (kind, inner) = object.iter().next().unwrap();
+    match kind.as_str() {
+        "nullValue" if inner.is_null() => Ok(()),
+        "booleanValue" if inner.is_boolean() => Ok(()),
+        "integerValue" if inner.as_str().and_then(|s| s.parse::<i64>().ok()).is_some() => Ok(()),
+        "doubleValue"
+            if inner.as_f64().is_some_and(f64::is_finite)
+                || matches!(inner.as_str(), Some("NaN" | "Infinity" | "-Infinity")) =>
+        {
+            Ok(())
+        }
+        "stringValue" | "referenceValue" | "bytesValue" if inner.is_string() => Ok(()),
+        "timestampValue"
+            if inner.is_string()
+                || inner.as_object().is_some_and(|o| {
+                    o.len() == 2
+                        && o.get("seconds").is_some_and(|v| {
+                            v.as_i64().is_some()
+                                || v.as_str().and_then(|s| s.parse::<i64>().ok()).is_some()
+                        })
+                        && o.get("nanos")
+                            .and_then(Value::as_i64)
+                            .is_some_and(|n| (0..1_000_000_000).contains(&n))
+                }) =>
+        {
+            Ok(())
+        }
+        "geoPointValue"
+            if inner.as_object().is_some_and(|o| {
+                o.len() == 2
+                    && o.get("latitude")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|v| v.is_finite() && (-90.0..=90.0).contains(&v))
+                    && o.get("longitude")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|v| v.is_finite() && (-180.0..=180.0).contains(&v))
+            }) =>
+        {
+            Ok(())
+        }
+        "arrayValue" => {
+            let array = inner
+                .as_object()
+                .and_then(|o| if o.len() == 1 { o.get("values") } else { None })
+                .and_then(Value::as_array)
+                .ok_or("array needs a values list")?;
+            for item in array {
+                validate_typed_value(item, depth + 1)?;
+            }
+            Ok(())
+        }
+        "mapValue" => {
+            let fields = inner
+                .as_object()
+                .and_then(|o| if o.len() == 1 { o.get("fields") } else { None })
+                .and_then(Value::as_object)
+                .ok_or("map needs a fields object")?;
+            for (name, item) in fields {
+                if !valid_document_segment(name) {
+                    return Err("map has an invalid field name");
+                }
+                validate_typed_value(item, depth + 1)?;
+            }
+            Ok(())
+        }
+        _ => Err("invalid Firestore value or type"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldMutationRequest {
+    project: String,
+    #[serde(default = "default_database")]
+    database: String,
+    document_path: String,
+    action: String,
+    field_name: String,
+    new_field_name: Option<String>,
+    value: Option<Value>,
+    expected_update_time: Value,
+}
+
+async fn mutate_field(
+    State(state): State<UiState>,
+    Json(request): Json<FieldMutationRequest>,
+) -> Response {
+    if !valid_segment(&request.project)
+        || !valid_segment(&request.database)
+        || !valid_document_segment(&request.field_name)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid project, database, or field name",
+        );
+    }
+    let Some(parts) = path_parts(&request.document_path) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid document path");
+    };
+    if parts.len() % 2 != 0 {
+        return api_error(StatusCode::BAD_REQUEST, "path must identify a document");
+    }
+    let database = format!(
+        "projects/{}/databases/{}",
+        request.project, request.database
+    );
+    let name = format!("{database}/documents/{}", request.document_path);
+    let current = match state.firestore.database_documents(&database).await {
+        Ok(documents) => documents.into_iter().find(|document| document.name == name),
+        Err(error) => return api_error(StatusCode::BAD_GATEWAY, error.message()),
+    };
+    let Some(current) = current else {
+        return api_error(StatusCode::NOT_FOUND, "document no longer exists");
+    };
+    if document_json(&current)["updateTime"] != request.expected_update_time {
+        return api_error(
+            StatusCode::CONFLICT,
+            "document changed; refresh and try again",
+        );
+    }
+    let mut fields = std::collections::HashMap::new();
+    let mut paths = vec![quoted_field_path(&request.field_name)];
+    match request.action.as_str() {
+        "add" => {
+            if current.fields.contains_key(&request.field_name) {
+                return api_error(StatusCode::CONFLICT, "field already exists");
+            }
+            let Some(value) = request.value.as_ref() else {
+                return api_error(StatusCode::BAD_REQUEST, "field value is required");
+            };
+            if let Err(message) = validate_typed_value(value, 0) {
+                return api_error(StatusCode::BAD_REQUEST, message);
+            }
+            let value = match value_proto(value) {
+                Ok(value) => value,
+                Err(error) => return api_error(StatusCode::BAD_REQUEST, error.message()),
+            };
+            fields.insert(request.field_name.clone(), value);
+        }
+        "delete" => {
+            if !current.fields.contains_key(&request.field_name) {
+                return api_error(StatusCode::NOT_FOUND, "field no longer exists");
+            }
+        }
+        "rename" => {
+            let Some(destination) = request.new_field_name.as_ref() else {
+                return api_error(StatusCode::BAD_REQUEST, "new field name is required");
+            };
+            if !valid_document_segment(destination) || destination == &request.field_name {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "enter a different valid field name",
+                );
+            }
+            if current.fields.contains_key(destination) {
+                return api_error(StatusCode::CONFLICT, "destination field already exists");
+            }
+            let Some(value) = current.fields.get(&request.field_name) else {
+                return api_error(StatusCode::NOT_FOUND, "field no longer exists");
+            };
+            fields.insert(destination.clone(), value.clone());
+            paths.push(quoted_field_path(destination));
+        }
+        _ => return api_error(StatusCode::BAD_REQUEST, "invalid field action"),
+    }
+    let precondition = match current.update_time {
+        Some(time) => precondition::ConditionType::UpdateTime(time),
+        None => precondition::ConditionType::Exists(true),
+    };
+    let write = Write {
+        operation: Some(write::Operation::Update(Document {
+            name,
+            fields,
+            ..Default::default()
+        })),
+        update_mask: Some(DocumentMask { field_paths: paths }),
+        current_document: Some(Precondition {
+            condition_type: Some(precondition),
+        }),
+        ..Default::default()
+    };
+    match Firestore::commit(
+        &state.firestore,
+        Request::new(CommitRequest {
+            database,
+            writes: vec![write],
+            ..Default::default()
+        }),
+    )
+    .await
+    {
+        Ok(_) => Json(json!({"updated": true})).into_response(),
+        Err(error) if error.code() == tonic::Code::FailedPrecondition => api_error(
+            StatusCode::CONFLICT,
+            "document changed; refresh and try again",
+        ),
+        Err(error) => api_error(StatusCode::BAD_REQUEST, error.message()),
+    }
 }
 
 async fn update_field(
@@ -738,6 +949,165 @@ mod tests {
         assert_eq!(
             documents[0].fields["bytes"].value_type,
             document(root).fields["bytes"].value_type
+        );
+    }
+
+    #[tokio::test]
+    async fn field_mutations_preserve_types_scope_and_reject_stale_or_invalid_changes() {
+        let state = state();
+        let name = "projects/demo-ui/databases/(default)/documents/items/source";
+        let other = "projects/demo-ui/databases/other/documents/items/source";
+        let mut original = document(name);
+        original.update_time = Some(prost_types::Timestamp {
+            seconds: 1,
+            nanos: 2,
+        });
+        let mut untouched = document(other);
+        untouched.update_time = original.update_time;
+        {
+            let mut store = state.firestore.store.lock().await;
+            store.documents.insert(name.into(), original.clone());
+            store.documents.insert(other.into(), untouched.clone());
+        }
+        let app = router(state.clone());
+        let base = json!({"project":"demo-ui","database":"(default)","documentPath":"items/source","expectedUpdateTime":document_json(&original)["updateTime"]});
+        let mut body = base.clone();
+        body["action"] = json!("add");
+        body["fieldName"] = json!("literal.dot`field");
+        body["value"] = json!({"mapValue":{"fields":{"nested":{"arrayValue":{"values":[{"integerValue":"9223372036854775807"},{"bytesValue":"AP8="}]}}}}});
+        assert_eq!(
+            request_json(
+                app.clone(),
+                "POST",
+                "/api/firestore/field-mutation",
+                body.clone()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let changed = state
+            .firestore
+            .database_documents("projects/demo-ui/databases/(default)")
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            changed.fields["literal.dot`field"].value_type,
+            value_proto(&body["value"]).unwrap().value_type
+        );
+        assert_eq!(changed.fields["large"], original.fields["large"]);
+        assert_eq!(
+            state
+                .firestore
+                .database_documents("projects/demo-ui/databases/other")
+                .await
+                .unwrap()[0]
+                .fields,
+            untouched.fields
+        );
+        assert_eq!(
+            request_json(
+                app.clone(),
+                "POST",
+                "/api/firestore/field-mutation",
+                body.clone()
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let mut duplicate = body.clone();
+        duplicate["expectedUpdateTime"] = document_json(&changed)["updateTime"].clone();
+        assert_eq!(
+            request_json(
+                app.clone(),
+                "POST",
+                "/api/firestore/field-mutation",
+                duplicate
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let mut rename = base.clone();
+        rename["expectedUpdateTime"] = document_json(&changed)["updateTime"].clone();
+        rename["action"] = json!("rename");
+        rename["fieldName"] = json!("literal.dot`field");
+        rename["newFieldName"] = json!("renamed`dot.field");
+        assert_eq!(
+            request_json(
+                app.clone(),
+                "POST",
+                "/api/firestore/field-mutation",
+                rename.clone()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let renamed = state
+            .firestore
+            .database_documents("projects/demo-ui/databases/(default)")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(!renamed.fields.contains_key("literal.dot`field"));
+        assert_eq!(
+            renamed.fields["renamed`dot.field"].value_type,
+            value_proto(&body["value"]).unwrap().value_type
+        );
+        rename["expectedUpdateTime"] = document_json(&renamed)["updateTime"].clone();
+        rename["fieldName"] = json!("renamed`dot.field");
+        rename["newFieldName"] = json!("large");
+        assert_eq!(
+            request_json(app.clone(), "POST", "/api/firestore/field-mutation", rename)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut delete = base.clone();
+        delete["expectedUpdateTime"] = document_json(&renamed)["updateTime"].clone();
+        delete["action"] = json!("delete");
+        delete["fieldName"] = json!("renamed`dot.field");
+        assert_eq!(
+            request_json(app.clone(), "POST", "/api/firestore/field-mutation", delete)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let final_doc = state
+            .firestore
+            .database_documents("projects/demo-ui/databases/(default)")
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(final_doc.fields, original.fields);
+        let mut invalid = base.clone();
+        invalid["expectedUpdateTime"] = document_json(&final_doc)["updateTime"].clone();
+        invalid["action"] = json!("add");
+        invalid["fieldName"] = json!("bad");
+        invalid["value"] = json!({"mapValue":{"fields":{"x":17}}});
+        assert_eq!(
+            request_json(
+                app.clone(),
+                "POST",
+                "/api/firestore/field-mutation",
+                invalid
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        state.firestore.store.lock().await.documents.remove(name);
+        let mut missing = base;
+        missing["action"] = json!("delete");
+        missing["fieldName"] = json!("large");
+        assert_eq!(
+            request_json(app, "POST", "/api/firestore/field-mutation", missing)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
         );
     }
 

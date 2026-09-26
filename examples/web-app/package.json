@@ -8,7 +8,8 @@
     "test": "vitest run",
     "probe": "node scripts/probe.mjs",
     "test:integration": "node scripts/probe.mjs --strict",
-    "test:persistence": "node scripts/persistence-restart.mjs"
+    "test:persistence": "node scripts/persistence-restart.mjs",
+    "test:console-fields": "node scripts/console-fields.mjs"
   },
   "dependencies": {
     "firebase": "12.12.1",
