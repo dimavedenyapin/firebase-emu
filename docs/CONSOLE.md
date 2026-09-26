@@ -27,6 +27,15 @@ show the current path. Open a nested collection from its parent document.
 You can edit values inline. Each fixed Firestore type appears below its field
 name. An invalid typed value does not change the document.
 
+Select **Add field** in an open document, enter a field name, choose a type,
+and enter its value. Empty documents also show this action. For maps and arrays,
+enter Firestore REST Value JSON with a type wrapper for each nested value.
+Select **Rename** beside a field to change its name without changing its type
+or value. Select **Delete** beside a field and confirm the prompt to remove it.
+Names with dots or backticks are treated as literal top-level field names.
+The console reports duplicate names, invalid values, missing documents, and
+changes made after the document was loaded. Refresh before retrying a stale edit.
+
 ![Firestore console with synthetic typed fields](images/console-firestore.png)
 
 ### Copy an object

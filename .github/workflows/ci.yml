@@ -86,6 +86,10 @@ jobs:
         run: npm run test:pubsub --prefix functions-runtime
       - name: Install Chromium for SDK and restart tests
         run: npx --prefix examples/web-app playwright install --with-deps chromium
+      - name: Test console field controls in desktop and mobile browser
+        env:
+          FIRERUST_BINARY: target/release/firebase-emu
+        run: npm run test:console-fields --prefix examples/web-app
       - name: Test real Node and browser SDK traffic
         shell: bash
         run: |
