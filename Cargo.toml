@@ -22,7 +22,7 @@ rusqlite = { version = "0.32", default-features = false, features = ["bundled"] 
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.12"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 
