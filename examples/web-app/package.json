@@ -17,8 +17,8 @@
     "react-dom": "16.14.0"
   },
   "devDependencies": {
-    "vite": "5.4.21",
-    "vitest": "2.1.9",
+    "vite": "8.3.5",
+    "vitest": "5.1.0",
     "jsdom": "25.0.1",
     "@testing-library/react": "12.1.5",
     "playwright": "1.58.2"
