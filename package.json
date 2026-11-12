@@ -1,6 +1,6 @@
 {
   "name": "firebase-emu-rs",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "FireRust local emulator for Firestore, Auth, Storage, Pub/Sub, and Firebase Functions",
   "license": "Apache-2.0",
   "repository": "github:dimavedenyapin/firebase-emu",
